@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local agent/tool metadata
+.agents/
+.codex/
+
+# Data and archives
+data/
+*.zip
+
+# Generated models and experiment outputs
+models/
+models_*/
+validation/
+validation_*/
+submissions/*.csv
+!sample_submission.csv
+
+# Local OS/editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
