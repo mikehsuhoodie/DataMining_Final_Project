@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import logging
 from pathlib import Path
 
@@ -8,7 +9,7 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import mean_absolute_error
 
-from make_features import HORIZONS, build_validation_sets, configure_logging, read_train_csv
+from make_features import HORIZONS, build_validation_set_for_horizon, configure_logging, read_train_csv
 from train import make_model
 
 
@@ -29,6 +30,12 @@ def parse_args() -> argparse.Namespace:
         help="Subsample each horizon after feature generation. Use 0 for no limit.",
     )
     parser.add_argument("--debug", action="store_true", help="Fast run using 20 regions and fewer examples.")
+    parser.add_argument(
+        "--n-jobs",
+        type=int,
+        default=1,
+        help="Number of worker processes for feature generation. Use 0 for conservative auto mode.",
+    )
     parser.add_argument(
         "--no-score-features",
         action="store_true",
@@ -72,15 +79,6 @@ def main() -> None:
 
     LOGGER.info("Reading training data from %s", args.train_csv)
     train_df = read_train_csv(args.train_csv, max_regions=max_regions)
-    LOGGER.info("Building validation split")
-    train_data, val_data = build_validation_sets(
-        train_df,
-        val_weeks=args.val_weeks,
-        stride=stride,
-        max_train_examples_per_horizon=max_examples,
-        include_score_features=not args.no_score_features,
-    )
-
     rows = []
     all_y = []
     all_model_pred = []
@@ -89,15 +87,22 @@ def main() -> None:
     all_recent = []
 
     for h in HORIZONS:
-        X_train = train_data.X_by_horizon[h]
-        y_train = train_data.y_by_horizon[h]
-        X_val = val_data.X_by_horizon[h].reindex(columns=X_train.columns, fill_value=0.0)
-        y_val = val_data.y_by_horizon[h]
+        LOGGER.info("Building validation split for horizon %d", h)
+        X_train, y_train, _train_meta, X_val, y_val, val_meta = build_validation_set_for_horizon(
+            train_df,
+            horizon=h,
+            val_weeks=args.val_weeks,
+            stride=stride,
+            max_train_examples=max_examples,
+            include_score_features=not args.no_score_features,
+            n_jobs=args.n_jobs,
+        )
+        X_val = X_val.reindex(columns=X_train.columns, fill_value=0.0)
         if len(X_train) == 0 or len(X_val) == 0:
             LOGGER.warning("Skipping horizon %d because train or validation data is empty", h)
             continue
 
-        base = baseline_scores(train_df, val_data.meta_by_horizon[h], y_val)
+        base = baseline_scores(train_df, val_meta, y_val)
         model, model_kind = make_model(random_state=42 + h)
         LOGGER.info("Training validation horizon %d %s on %d rows", h, model_kind, len(X_train))
         model.fit(X_train, y_train)
@@ -121,9 +126,11 @@ def main() -> None:
         labeled = train_df.dropna(subset=["score"])
         region_mean = labeled.groupby("region_id", sort=False)["score"].mean().to_dict()
         region_recent = labeled.groupby("region_id", sort=False)["score"].apply(lambda s: s.tail(8).mean()).to_dict()
-        regions = val_data.meta_by_horizon[h]["region_id"].astype(str).to_numpy()
+        regions = val_meta["region_id"].astype(str).to_numpy()
         all_region.append(np.array([region_mean.get(r, np.nanmean(train_df["score"])) for r in regions], dtype=np.float32))
         all_recent.append(np.array([region_recent.get(r, region_mean.get(r, np.nanmean(train_df["score"]))) for r in regions], dtype=np.float32))
+        del X_train, y_train, X_val, y_val, val_meta, model
+        gc.collect()
 
     summary = pd.DataFrame(rows)
     if not summary.empty:

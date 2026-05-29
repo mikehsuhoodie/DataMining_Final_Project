@@ -58,6 +58,9 @@ Validation is time-based, not random. For each region, `src/validate.py` holds o
 - First model result.
 - Overall MAE and MAE by horizon.
 
+For memory control, validation builds and trains one horizon at a time instead
+of materializing all five horizon feature matrices at once.
+
 Quick check:
 
 ```bash
@@ -69,6 +72,19 @@ Fuller validation can be run by increasing regions/examples or disabling caps:
 ```bash
 .venv/bin/python src/validate.py --stride 4 --max-train-examples-per-horizon 250000
 ```
+
+Feature generation can be parallelized across independent regions:
+
+```bash
+.venv/bin/python src/validate.py --n-jobs 4
+```
+
+Use `--n-jobs 0` for conservative auto mode, currently capped at 4 workers.
+Keep this lower if memory pressure or CPU contention with model training becomes
+a problem.
+
+Parallel workers receive only one region's `values`, `dates`, and `scores`
+arrays at a time, not the full training DataFrame.
 
 Weather-only validation:
 
@@ -83,6 +99,16 @@ Default training uses every fourth weekly target and caps each horizon at 250,00
 ```bash
 .venv/bin/python src/train.py
 ```
+
+Parallel feature generation during training:
+
+```bash
+.venv/bin/python src/train.py --n-jobs 4
+```
+
+Training still builds and fits one horizon at a time, so `--n-jobs` speeds up
+per-horizon feature generation without materializing all five horizon matrices
+at once.
 
 Weather-only training:
 

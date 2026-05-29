@@ -77,6 +77,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--debug", action="store_true", help="Fast run using 20 regions and fewer examples.")
     parser.add_argument(
+        "--n-jobs",
+        type=int,
+        default=1,
+        help="Number of worker processes for feature generation. Use 0 for conservative auto mode.",
+    )
+    parser.add_argument(
         "--no-score-features",
         action="store_true",
         help="Train weather-only models without historical score persistence features.",
@@ -109,6 +115,7 @@ def main() -> None:
         "max_train_examples_per_horizon": max_examples,
         "include_score_features": not args.no_score_features,
         "score_history_timing": "window_start" if not args.no_score_features else "disabled",
+        "feature_n_jobs": args.n_jobs,
     }
 
     for h in HORIZONS:
@@ -119,6 +126,7 @@ def main() -> None:
             stride=stride,
             max_train_examples=max_examples,
             include_score_features=not args.no_score_features,
+            n_jobs=args.n_jobs,
         )
         if len(X) == 0:
             raise RuntimeError(f"No training examples were built for horizon {h}.")

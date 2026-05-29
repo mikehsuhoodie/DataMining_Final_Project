@@ -25,10 +25,30 @@ data/
 # Generated models and experiment outputs
 models/
 models_*/
+checkpoints/
+checkpoints_*/
+runs/
+runs_*/
 validation/
 validation_*/
+feature_analysis/
+feature_analysis_*/
 submissions/*.csv
 !sample_submission.csv
+
+# Model parameters / serialized artifacts
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.h5
+*.hdf5
+*.onnx
+*.pkl
+*.pickle
+*.joblib
+*.bin
+*.npz
 
 # Local OS/editor files
 .DS_Store
