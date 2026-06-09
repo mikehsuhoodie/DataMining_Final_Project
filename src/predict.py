@@ -19,7 +19,7 @@ LOGGER = logging.getLogger(__name__)
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate Kaggle submission predictions.")
     parser.add_argument("--test-csv", default="data/test.csv")
-    parser.add_argument("--train-csv", default="data/train.csv", help="Used only for historical score features.")
+    parser.add_argument("--train-csv", default="data/train.csv", help="Used for region weather climatology and optional score history.")
     parser.add_argument("--sample-submission", default="sample_submission.csv")
     parser.add_argument("--model-dir", default="models")
     parser.add_argument("--output", default="submissions/submission.csv")
@@ -72,15 +72,44 @@ def main() -> None:
         raise FileNotFoundError(f"Missing {metadata_path}. Run python src/train.py first.")
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     include_score_features = bool(metadata.get("include_score_features", True))
-    train_df = None
-    if include_score_features or args.mode == "blend-latest":
-        LOGGER.info("Reading train labels from %s", args.train_csv)
-        train_df = read_train_csv(args.train_csv, max_regions=None)
+    feature_columns_by_horizon = metadata["feature_columns_by_horizon"]
+    legacy_ablation_features = {
+        "region_seasonal_coverage_w28",
+        "region_seasonal_coverage_w91",
+        "day_index_mod_365",
+        "prec_week13_sum",
+    }
+    include_legacy_ablation_features = any(
+        legacy_ablation_features.intersection(feature_columns)
+        for feature_columns in feature_columns_by_horizon.values()
+    )
+    include_raw_wind_features = any(
+        "wind_w7_mean" in feature_columns
+        for feature_columns in feature_columns_by_horizon.values()
+    )
+    include_prec_w56_min = any(
+        "prec_w56_min" in feature_columns
+        for feature_columns in feature_columns_by_horizon.values()
+    )
+    include_raw_wb_tmp_features = any(
+        "wb_tmp_w7_mean" in feature_columns
+        for feature_columns in feature_columns_by_horizon.values()
+    )
+    LOGGER.info("Reading train weather history from %s", args.train_csv)
+    train_df = read_train_csv(args.train_csv, max_regions=None)
 
     LOGGER.info("Reading test data from %s", args.test_csv)
     test_df = read_test_csv(args.test_csv, max_regions=args.max_regions)
     LOGGER.info("Building test features")
-    X_test, meta = build_test_features(test_df, train_df, include_score_features=include_score_features)
+    X_test, meta = build_test_features(
+        test_df,
+        train_df,
+        include_score_features=include_score_features,
+        include_legacy_ablation_features=include_legacy_ablation_features,
+        include_raw_wind_features=include_raw_wind_features,
+        include_prec_w56_min=include_prec_w56_min,
+        include_raw_wb_tmp_features=include_raw_wb_tmp_features,
+    )
 
     pred_by_horizon = {}
     for h in HORIZONS:
@@ -88,7 +117,7 @@ def main() -> None:
         if not model_path.exists():
             raise FileNotFoundError(f"Missing {model_path}. Run python src/train.py first.")
         model = joblib.load(model_path)
-        feature_columns = metadata["feature_columns_by_horizon"][str(h)]
+        feature_columns = feature_columns_by_horizon[str(h)]
         Xh = align_feature_columns(X_test, feature_columns)
         pred_by_horizon[h] = np.clip(model.predict(Xh), 0.0, 5.0)
         LOGGER.info("Predicted horizon %d", h)

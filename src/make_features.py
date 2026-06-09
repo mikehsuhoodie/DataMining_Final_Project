@@ -11,6 +11,7 @@ import logging
 import os
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable
 
@@ -42,6 +43,9 @@ WINDOW_DAYS = 91
 HORIZONS = [1, 2, 3, 4, 5]
 ROLLING_WINDOWS = [7, 14, 28, 56, 91]
 PERCENTILES = [10, 50, 90]
+WEEKLY_BIN_DAYS = 7
+WEEKLY_BIN_COUNT = WINDOW_DAYS // WEEKLY_BIN_DAYS
+REGION_SEASONAL_WINDOWS = [28, 91]
 
 COL_IDX = {c: i for i, c in enumerate(WEATHER_COLS)}
 PREC_IDX = COL_IDX["prec"]
@@ -63,6 +67,15 @@ class FeatureBuildResult:
     X_by_horizon: dict[int, pd.DataFrame]
     y_by_horizon: dict[int, np.ndarray]
     meta_by_horizon: dict[int, pd.DataFrame]
+
+
+@dataclass(frozen=True)
+class RegionSeasonalContext:
+    """Monthly weather climatology, optionally stored as expanding prefixes."""
+
+    sums: np.ndarray | tuple[np.ndarray, ...]
+    counts: np.ndarray | tuple[np.ndarray, ...]
+    row_indices: tuple[np.ndarray, ...] | None = None
 
 
 def configure_logging(verbose: bool = False) -> None:
@@ -121,8 +134,9 @@ def build_validation_sets(
         _extend_horizon_dicts(train_rows, train_y, train_meta, *region_result["train"])
         _extend_horizon_dicts(val_rows, val_y, val_meta, *region_result["val"])
 
-    train_result = _to_result(train_rows, train_y, train_meta, max_train_examples_per_horizon)
-    val_result = _to_result(val_rows, val_y, val_meta, None)
+    feature_columns = _feature_columns(include_score_features)
+    train_result = _to_result(train_rows, train_y, train_meta, max_train_examples_per_horizon, feature_columns)
+    val_result = _to_result(val_rows, val_y, val_meta, None, feature_columns)
     return train_result, val_result
 
 
@@ -156,15 +170,16 @@ def build_validation_set_for_horizon(
     for region_train_rows, region_train_y, region_train_meta, region_val_rows, region_val_y, region_val_meta in (
         _run_region_workers(_build_validation_region_for_horizon, worker_args, n_jobs)
     ):
-        train_rows.extend(region_train_rows)
+        _append_feature_chunk(train_rows, region_train_rows)
         train_y.extend(region_train_y)
         train_meta.extend(region_train_meta)
-        val_rows.extend(region_val_rows)
+        _append_feature_chunk(val_rows, region_val_rows)
         val_y.extend(region_val_y)
         val_meta.extend(region_val_meta)
 
-    X_train, y_train, meta_train = _to_frame(train_rows, train_y, train_meta, max_train_examples, horizon)
-    X_val, y_val, meta_val = _to_frame(val_rows, val_y, val_meta, None, horizon)
+    feature_columns = _feature_columns(include_score_features)
+    X_train, y_train, meta_train = _to_frame(train_rows, train_y, train_meta, max_train_examples, horizon, feature_columns)
+    X_val, y_val, meta_val = _to_frame(val_rows, val_y, val_meta, None, horizon, feature_columns)
     return X_train, y_train, meta_train, X_val, y_val, meta_val
 
 
@@ -188,7 +203,7 @@ def build_training_sets(
     for region_rows, region_y, region_meta in _run_region_workers(_build_training_region, worker_args, n_jobs):
         _extend_horizon_dicts(rows, y, meta, region_rows, region_y, region_meta)
 
-    return _to_result(rows, y, meta, max_train_examples_per_horizon)
+    return _to_result(rows, y, meta, max_train_examples_per_horizon, _feature_columns(include_score_features))
 
 
 def build_training_set_for_horizon(
@@ -219,11 +234,11 @@ def build_training_set_for_horizon(
         worker_args,
         n_jobs,
     ):
-        rows.extend(region_rows)
+        _append_feature_chunk(rows, region_rows)
         y.extend(region_y)
         meta.extend(region_meta)
 
-    X, yy, mm = _to_frame(rows, y, meta, max_train_examples, horizon)
+    X, yy, mm = _to_frame(rows, y, meta, max_train_examples, horizon, _feature_columns(include_score_features))
     return X, yy, mm
 
 
@@ -231,10 +246,15 @@ def build_test_features(
     test_df: pd.DataFrame,
     train_df: pd.DataFrame | None = None,
     include_score_features: bool = True,
+    include_legacy_ablation_features: bool = False,
+    include_raw_wind_features: bool = False,
+    include_prec_w56_min: bool = False,
+    include_raw_wb_tmp_features: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     rows = []
     meta = []
     history_by_region = _latest_score_history_by_region(train_df) if include_score_features and train_df is not None else {}
+    seasonal_by_region = _latest_region_seasonal_context_by_region(train_df)
 
     for region_id, g in _iter_regions(test_df):
         values = g[WEATHER_COLS].to_numpy(dtype=np.float32)
@@ -242,7 +262,20 @@ def build_test_features(
         cutoff = len(g)
         if cutoff < WINDOW_DAYS:
             raise ValueError(f"Region {region_id} has only {cutoff} test days; expected at least {WINDOW_DAYS}.")
-        rows.append(compute_window_features(values, dates, cutoff, history_by_region.get(region_id), include_score_features))
+        rows.append(
+            compute_window_features(
+                values,
+                dates,
+                cutoff,
+                history_by_region.get(region_id),
+                include_score_features,
+                seasonal_context=seasonal_by_region.get(region_id),
+                include_legacy_ablation_features=include_legacy_ablation_features,
+                include_raw_wind_features=include_raw_wind_features,
+                include_prec_w56_min=include_prec_w56_min,
+                include_raw_wb_tmp_features=include_raw_wb_tmp_features,
+            )
+        )
         meta.append({"region_id": region_id})
 
     return pd.DataFrame(rows).fillna(0.0), pd.DataFrame(meta)
@@ -254,6 +287,12 @@ def compute_window_features(
     cutoff: int,
     score_history: dict[str, float] | None = None,
     include_score_features: bool = True,
+    seasonal_context: RegionSeasonalContext | None = None,
+    seasonal_history_end: int | None = None,
+    include_legacy_ablation_features: bool = False,
+    include_raw_wind_features: bool = False,
+    include_prec_w56_min: bool = False,
+    include_raw_wb_tmp_features: bool = False,
 ) -> dict[str, float]:
     window = values[cutoff - WINDOW_DAYS : cutoff]
     if len(window) != WINDOW_DAYS:
@@ -318,7 +357,23 @@ def compute_window_features(
     feats["surface_heat_low_humidity_w7"] = float(surf_tmp7 / (1.0 + humidity7))
     feats["dry_fraction_w91"] = float(np.mean(dry))
 
-    feats.update(_date_features(str(dates[cutoff - 1]), cutoff))
+    feats.update(_weekly_bin_features(window, include_legacy_ablation_features))
+    feats.update(
+        _region_seasonal_anomaly_features(
+            window,
+            dates[cutoff - WINDOW_DAYS : cutoff],
+            seasonal_context,
+            seasonal_history_end,
+            include_legacy_ablation_features,
+        )
+    )
+    feats.update(_date_features(str(dates[cutoff - 1]), cutoff, include_legacy_ablation_features))
+    if not include_raw_wind_features:
+        feats = _without_raw_wind_features(feats)
+    if not include_prec_w56_min:
+        feats.pop("prec_w56_min", None)
+    if not include_raw_wb_tmp_features:
+        feats = _without_raw_weather_summaries(feats, ("wb_tmp_",))
     if not include_score_features:
         return feats
     if score_history:
@@ -328,24 +383,51 @@ def compute_window_features(
     return feats
 
 
+def _without_raw_wind_features(feats: dict[str, float]) -> dict[str, float]:
+    wind_prefixes = ("wind_", "wind_max_", "wind_min_", "wind_range_")
+    return _without_raw_weather_summaries(feats, wind_prefixes)
+
+
+def _without_raw_weather_summaries(
+    feats: dict[str, float],
+    weather_prefixes: tuple[str, ...],
+) -> dict[str, float]:
+    keep_markers = ("_region_seasonal_anom_", "_weekly_trend_13w")
+    return {
+        feature: value
+        for feature, value in feats.items()
+        if not feature.startswith(weather_prefixes)
+        or "_week" in feature
+        or any(marker in feature for marker in keep_markers)
+    }
+
+
 def align_feature_columns(X: pd.DataFrame, feature_columns: Iterable[str]) -> pd.DataFrame:
     return X.reindex(columns=list(feature_columns), fill_value=0.0)
 
 
-def _to_result(rows, y, meta, max_examples: int | None) -> FeatureBuildResult:
+def _to_result(rows, y, meta, max_examples: int | None, feature_columns: list[str]) -> FeatureBuildResult:
     X_by_horizon = {}
     y_by_horizon = {}
     meta_by_horizon = {}
     for h in HORIZONS:
-        X, yy, mm = _to_frame(rows[h], y[h], meta[h], max_examples, h)
+        X, yy, mm = _to_frame(rows[h], y[h], meta[h], max_examples, h, feature_columns)
         X_by_horizon[h] = X
         y_by_horizon[h] = yy
         meta_by_horizon[h] = mm
     return FeatureBuildResult(X_by_horizon, y_by_horizon, meta_by_horizon)
 
 
-def _to_frame(rows, y, meta, max_examples: int | None, horizon: int) -> tuple[pd.DataFrame, np.ndarray, pd.DataFrame]:
-    X = pd.DataFrame(rows).fillna(0.0)
+def _to_frame(
+    rows,
+    y,
+    meta,
+    max_examples: int | None,
+    horizon: int,
+    feature_columns: list[str],
+) -> tuple[pd.DataFrame, np.ndarray, pd.DataFrame]:
+    matrix = np.concatenate(rows, axis=0) if rows else np.empty((0, len(feature_columns)), dtype=np.float32)
+    X = pd.DataFrame(matrix, columns=feature_columns).fillna(0.0)
     yy = np.asarray(y, dtype=np.float32)
     mm = pd.DataFrame(meta)
     if max_examples and len(X) > max_examples:
@@ -430,9 +512,14 @@ def _ordered_bounded_map(executor: ProcessPoolExecutor, worker_fn, worker_args, 
 
 def _extend_horizon_dicts(rows, y, meta, region_rows, region_y, region_meta) -> None:
     for h in HORIZONS:
-        rows[h].extend(region_rows[h])
+        _append_feature_chunk(rows[h], region_rows[h])
         y[h].extend(region_y[h])
         meta[h].extend(region_meta[h])
+
+
+def _append_feature_chunk(chunks: list[np.ndarray], chunk: np.ndarray) -> None:
+    if len(chunk):
+        chunks.append(chunk)
 
 
 def _empty_horizon_lists() -> tuple[dict[int, list], dict[int, list], dict[int, list]]:
@@ -461,12 +548,18 @@ def _build_validation_region(args):
 
     label_idx = np.flatnonzero(~np.isnan(scores))
     if len(label_idx) < val_weeks + max(HORIZONS) + 1:
-        return {"train": (train_rows, train_y, train_meta), "val": (val_rows, val_y, val_meta)}
+        return {
+            "train": (_pack_feature_rows_by_horizon(train_rows), train_y, train_meta),
+            "val": (_pack_feature_rows_by_horizon(val_rows), val_y, val_meta),
+        }
 
     first_val_target = int(label_idx[-val_weeks])
     val_cutoff = first_val_target - 7
     if val_cutoff < WINDOW_DAYS:
-        return {"train": (train_rows, train_y, train_meta), "val": (val_rows, val_y, val_meta)}
+        return {
+            "train": (_pack_feature_rows_by_horizon(train_rows), train_y, train_meta),
+            "val": (_pack_feature_rows_by_horizon(val_rows), val_y, val_meta),
+        }
 
     get_features = _make_region_feature_getter(values, dates, scores, include_score_features)
 
@@ -489,7 +582,10 @@ def _build_validation_region(args):
             train_y[h].append(float(scores[target_idx]))
             train_meta[h].append({"region_id": region_id, "cutoff_idx": cutoff, "target_idx": int(target_idx)})
 
-    return {"train": (train_rows, train_y, train_meta), "val": (val_rows, val_y, val_meta)}
+    return {
+        "train": (_pack_feature_rows_by_horizon(train_rows), train_y, train_meta),
+        "val": (_pack_feature_rows_by_horizon(val_rows), val_y, val_meta),
+    }
 
 
 def _build_validation_region_for_horizon(args):
@@ -503,12 +599,12 @@ def _build_validation_region_for_horizon(args):
 
     label_idx = np.flatnonzero(~np.isnan(scores))
     if len(label_idx) < val_weeks + max(HORIZONS) + 1:
-        return train_rows, train_y, train_meta, val_rows, val_y, val_meta
+        return _pack_feature_rows(train_rows), train_y, train_meta, _pack_feature_rows(val_rows), val_y, val_meta
 
     first_val_target = int(label_idx[-val_weeks])
     val_cutoff = first_val_target - 7
     if val_cutoff < WINDOW_DAYS:
-        return train_rows, train_y, train_meta, val_rows, val_y, val_meta
+        return _pack_feature_rows(train_rows), train_y, train_meta, _pack_feature_rows(val_rows), val_y, val_meta
 
     get_features = _make_region_feature_getter(values, dates, scores, include_score_features)
 
@@ -529,7 +625,7 @@ def _build_validation_region_for_horizon(args):
         train_y.append(float(scores[target_idx]))
         train_meta.append({"region_id": region_id, "cutoff_idx": cutoff, "target_idx": int(target_idx)})
 
-    return train_rows, train_y, train_meta, val_rows, val_y, val_meta
+    return _pack_feature_rows(train_rows), train_y, train_meta, _pack_feature_rows(val_rows), val_y, val_meta
 
 
 def _build_training_region(args):
@@ -549,7 +645,7 @@ def _build_training_region(args):
             y[h].append(float(scores[target_idx]))
             meta[h].append({"region_id": region_id, "cutoff_idx": cutoff, "target_idx": int(target_idx)})
 
-    return rows, y, meta
+    return _pack_feature_rows_by_horizon(rows), y, meta
 
 
 def _build_training_region_for_horizon(args):
@@ -570,7 +666,7 @@ def _build_training_region_for_horizon(args):
         y.append(float(scores[target_idx]))
         meta.append({"region_id": region_id, "cutoff_idx": cutoff, "target_idx": int(target_idx)})
 
-    return rows, y, meta
+    return _pack_feature_rows(rows), y, meta
 
 
 def _make_region_feature_getter(
@@ -580,14 +676,40 @@ def _make_region_feature_getter(
     include_score_features: bool,
 ):
     cache: dict[int, dict[str, float]] = {}
+    seasonal_context = _expanding_region_seasonal_context(values, dates)
 
     def get_features(cutoff: int) -> dict[str, float]:
         if cutoff not in cache:
             hist = _score_history_for_window(scores, cutoff, include_score_features)
-            cache[cutoff] = compute_window_features(values, dates, cutoff, hist, include_score_features)
+            cache[cutoff] = compute_window_features(
+                values,
+                dates,
+                cutoff,
+                hist,
+                include_score_features,
+                seasonal_context=seasonal_context,
+                seasonal_history_end=max(0, cutoff - WINDOW_DAYS),
+            )
         return cache[cutoff]
 
     return get_features
+
+
+def _pack_feature_rows(rows: list[dict[str, float]]) -> np.ndarray:
+    if not rows:
+        return np.empty((0, 0), dtype=np.float32)
+    return np.asarray([list(row.values()) for row in rows], dtype=np.float32)
+
+
+def _pack_feature_rows_by_horizon(rows: dict[int, list[dict[str, float]]]) -> dict[int, np.ndarray]:
+    return {h: _pack_feature_rows(rows[h]) for h in HORIZONS}
+
+
+@lru_cache(maxsize=2)
+def _feature_columns(include_score_features: bool) -> list[str]:
+    values = np.zeros((WINDOW_DAYS, len(WEATHER_COLS)), dtype=np.float32)
+    dates = np.full(WINDOW_DAYS, "2000-01-01")
+    return list(compute_window_features(values, dates, WINDOW_DAYS, include_score_features=include_score_features))
 
 
 def _score_history_features(scores: np.ndarray, cutoff: int) -> dict[str, float]:
@@ -624,6 +746,147 @@ def _latest_score_history_by_region(train_df: pd.DataFrame | None) -> dict[str, 
     return out
 
 
+def _latest_region_seasonal_context_by_region(
+    train_df: pd.DataFrame | None,
+) -> dict[str, RegionSeasonalContext]:
+    if train_df is None:
+        return {}
+    out = {}
+    for region_id, g in _iter_regions(train_df):
+        values = g[WEATHER_COLS].to_numpy(dtype=np.float32)
+        dates = g["date"].to_numpy()
+        out[region_id] = _region_seasonal_summary(values, dates)
+    return out
+
+
+def _weekly_bin_features(window: np.ndarray, include_legacy_ablation_features: bool = False) -> dict[str, float]:
+    weekly = window.reshape(WEEKLY_BIN_COUNT, WEEKLY_BIN_DAYS, len(WEATHER_COLS))
+    means = np.nanmean(weekly, axis=1)
+    prec = weekly[:, :, PREC_IDX]
+    prec_sums = np.nansum(prec, axis=1)
+    dry_days = np.sum(prec == 0, axis=1)
+    feats = {}
+    # Week 13 duplicates the existing 7-day summaries.
+    bin_count = WEEKLY_BIN_COUNT if include_legacy_ablation_features else WEEKLY_BIN_COUNT - 1
+    for week_idx in range(bin_count):
+        week = week_idx + 1
+        for col_idx, col in enumerate(WEATHER_COLS):
+            feats[f"{col}_week{week:02d}_mean"] = float(means[week_idx, col_idx])
+        feats[f"prec_week{week:02d}_sum"] = float(prec_sums[week_idx])
+        feats[f"dry_days_week{week:02d}"] = float(dry_days[week_idx])
+
+    for col_idx, col in enumerate(WEATHER_COLS):
+        feats[f"{col}_weekly_trend_13w"] = _linear_trend(means[:, col_idx])
+    feats["prec_weekly_sum_trend_13w"] = _linear_trend(prec_sums)
+    feats["dry_days_weekly_trend_13w"] = _linear_trend(dry_days)
+    return feats
+
+
+def _linear_trend(values: np.ndarray) -> float:
+    x = np.arange(len(values), dtype=np.float32)
+    mask = ~np.isnan(values)
+    if np.sum(mask) < 2:
+        return 0.0
+    centered = x[mask] - np.mean(x[mask])
+    denominator = np.sum(centered * centered)
+    if denominator == 0:
+        return 0.0
+    return float(np.sum(centered * (values[mask] - np.mean(values[mask]))) / denominator)
+
+
+def _region_seasonal_summary(values: np.ndarray, dates: np.ndarray) -> RegionSeasonalContext:
+    months = _months_from_dates(dates)
+    sums = np.zeros((12, len(WEATHER_COLS)), dtype=np.float64)
+    counts = np.zeros((12, len(WEATHER_COLS)), dtype=np.int32)
+    for month in range(1, 13):
+        month_values = values[months == month]
+        if len(month_values) == 0:
+            continue
+        sums[month - 1] = np.nansum(month_values, axis=0)
+        counts[month - 1] = np.sum(~np.isnan(month_values), axis=0)
+    return RegionSeasonalContext(sums=sums, counts=counts)
+
+
+def _expanding_region_seasonal_context(values: np.ndarray, dates: np.ndarray) -> RegionSeasonalContext:
+    months = _months_from_dates(dates)
+    monthly_sums = []
+    monthly_counts = []
+    monthly_indices = []
+    for month in range(1, 13):
+        indices = np.flatnonzero(months == month)
+        month_values = values[indices]
+        sums = np.zeros((len(indices) + 1, len(WEATHER_COLS)), dtype=np.float32)
+        counts = np.zeros((len(indices) + 1, len(WEATHER_COLS)), dtype=np.int16)
+        sums[1:] = np.cumsum(np.nan_to_num(month_values, nan=0.0), axis=0)
+        counts[1:] = np.cumsum(~np.isnan(month_values), axis=0)
+        monthly_sums.append(sums)
+        monthly_counts.append(counts)
+        monthly_indices.append(indices)
+    return RegionSeasonalContext(
+        sums=tuple(monthly_sums),
+        counts=tuple(monthly_counts),
+        row_indices=tuple(monthly_indices),
+    )
+
+
+def _region_seasonal_anomaly_features(
+    window: np.ndarray,
+    window_dates: np.ndarray,
+    context: RegionSeasonalContext | None,
+    history_end: int | None,
+    include_legacy_ablation_features: bool = False,
+) -> dict[str, float]:
+    feats = {}
+    if context is None:
+        for size in REGION_SEASONAL_WINDOWS:
+            for col in WEATHER_COLS:
+                feats[f"{col}_region_seasonal_anom_w{size}"] = 0.0
+            if include_legacy_ablation_features:
+                feats[f"region_seasonal_coverage_w{size}"] = 0.0
+        return feats
+
+    sums, counts = _seasonal_snapshot(context, history_end)
+    overall_sum = np.sum(sums, axis=0)
+    overall_count = np.sum(counts, axis=0)
+    overall_mean = np.divide(overall_sum, overall_count, out=np.zeros_like(overall_sum), where=overall_count > 0)
+    months = _months_from_dates(window_dates)
+
+    for size in REGION_SEASONAL_WINDOWS:
+        sub = window[-size:]
+        sub_mean = np.nanmean(sub, axis=0)
+        month_weights = np.bincount(months[-size:] - 1, minlength=12).astype(np.float64)
+        month_means = np.divide(sums, counts, out=np.zeros_like(sums), where=counts > 0)
+        month_means = np.where(counts > 0, month_means, overall_mean[None, :])
+        baseline = np.sum(month_means * month_weights[:, None], axis=0) / size
+        baseline = np.where(overall_count > 0, baseline, sub_mean)
+        for col_idx, col in enumerate(WEATHER_COLS):
+            feats[f"{col}_region_seasonal_anom_w{size}"] = float(sub_mean[col_idx] - baseline[col_idx])
+        if include_legacy_ablation_features:
+            covered_days = np.sum(month_weights[:, None] * (counts > 0), axis=0)
+            feats[f"region_seasonal_coverage_w{size}"] = float(np.mean(covered_days / size))
+    return feats
+
+
+def _seasonal_snapshot(
+    context: RegionSeasonalContext,
+    history_end: int | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    if context.row_indices is None:
+        return context.sums, context.counts
+    end = np.iinfo(np.int64).max if history_end is None else max(0, history_end)
+    sums = np.zeros((12, len(WEATHER_COLS)), dtype=np.float64)
+    counts = np.zeros((12, len(WEATHER_COLS)), dtype=np.int32)
+    for month in range(12):
+        prefix_idx = int(np.searchsorted(context.row_indices[month], end, side="left"))
+        sums[month] = context.sums[month][prefix_idx]
+        counts[month] = context.counts[month][prefix_idx]
+    return sums, counts
+
+
+def _months_from_dates(dates: np.ndarray) -> np.ndarray:
+    return np.array([int(str(date).split("-")[1]) for date in dates], dtype=np.int8)
+
+
 def _empty_score_history() -> dict[str, float]:
     return {
         "score_last": 0.0,
@@ -637,20 +900,22 @@ def _empty_score_history() -> dict[str, float]:
     }
 
 
-def _date_features(date_text: str, cutoff: int) -> dict[str, float]:
+def _date_features(date_text: str, cutoff: int, include_legacy_ablation_features: bool = False) -> dict[str, float]:
     parts = date_text.split("-")
     month = int(parts[1]) if len(parts) > 1 else 1
     day = int(parts[2]) if len(parts) > 2 else 1
     doy = int(MONTH_START_DOY[month] + day)
     angle = 2.0 * np.pi * doy / 365.0
-    return {
+    feats = {
         "month": float(month),
         "day_of_year": float(doy),
         "week_of_year": float((doy - 1) // 7 + 1),
-        "day_index_mod_365": float(cutoff % 365),
         "doy_sin": float(np.sin(angle)),
         "doy_cos": float(np.cos(angle)),
     }
+    if include_legacy_ablation_features:
+        feats["day_index_mod_365"] = float(cutoff % 365)
+    return feats
 
 
 def _max_consecutive_true(mask: np.ndarray) -> int:

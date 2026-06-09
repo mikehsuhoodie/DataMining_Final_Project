@@ -122,6 +122,14 @@ Multi-scale history features:
 - Last 28 days.
 - Last 56 days.
 - Full 91 days.
+- Twelve non-overlapping weekly-bin summaries, ordered from oldest to newest,
+  plus per-variable 13-week trends to retain sequence shape. The thirteenth
+  bin is still used by the trends but is not emitted separately because it
+  duplicates the existing recent 7-day summaries.
+- Region seasonal anomalies over 28 and 91 days, using each region's historical
+  monthly weather climatology. Each anomaly subtracts a month-weighted expected
+  daily mean from the recent window mean. Training examples must only use
+  climatology available before their 91-day input window.
 
 Drought-oriented derived features:
 

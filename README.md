@@ -44,6 +44,17 @@ Features include:
 - Last value, last 3-day mean, last 7-day mean, and recent trend.
 - Precipitation sum, dry day count, rainy day count, and maximum consecutive dry days.
 - Recent-vs-91-day anomaly features.
+- Non-overlapping weekly bins for weeks 1 through 12, ordered from oldest to
+  newest, plus 13-week linear trends. Week 13 summaries are omitted because
+  they duplicate the existing 7-day summaries. These features preserve recent
+  weather sequence shape that a single 91-day summary would discard.
+- Region seasonal anomaly features over 28 and 91 days. Each weather summary is
+  compared with that region's month-weighted historical climatology. For
+  example, `prec_region_seasonal_anom_w91` is the recent 91-day daily mean
+  precipitation minus the expected daily mean precipitation for the same
+  region and mix of calendar months. Training windows only use weather history
+  before the 91-day input window starts; test features use climatology built
+  from that region's full history in `train.csv`.
 - Hot/dry and evaporation-risk proxy features using precipitation, `tmp_max`, wind, humidity, and surface temperature.
 - Relative seasonal features from anonymized date strings.
 - Optional historical score persistence features. When enabled, training examples only use scores before the 91-day weather window starts, matching the fact that test windows contain weather but no score labels. Use `--no-score-features` to train or validate weather-only models.
@@ -84,7 +95,10 @@ Keep this lower if memory pressure or CPU contention with model training becomes
 a problem.
 
 Parallel workers receive only one region's `values`, `dates`, and `scores`
-arrays at a time, not the full training DataFrame.
+arrays at a time, not the full training DataFrame. Each worker also builds a
+small expanding monthly weather climatology for leakage-safe region seasonal
+anomaly features. Completed region features are returned as compact `float32`
+NumPy chunks to limit parent-process memory usage.
 
 Weather-only validation:
 
@@ -108,13 +122,56 @@ Parallel feature generation during training:
 
 Training still builds and fits one horizon at a time, so `--n-jobs` speeds up
 per-horizon feature generation without materializing all five horizon matrices
-at once.
+at once. Each training run also writes `feature_importance.csv` under its model
+directory with per-horizon LightGBM split and gain importance. Use
+`src/analyze_features.py` separately when validation-based permutation
+importance is needed. Train gain importance is useful for selecting ablation
+candidates, but it is not enough by itself to prove that a feature should be
+deleted.
 
 Weather-only training:
 
 ```bash
 .venv/bin/python src/train.py --no-score-features --model-dir models_no_score
 ```
+
+Current expanded weather-only experiment:
+
+```bash
+.venv/bin/python src/train.py \
+  --model-dir models_exp_150k_s8_no_score_weekly_seasonal \
+  --max-train-examples-per-horizon 150000 \
+  --stride 8 \
+  --n-jobs 2 \
+  --no-score-features
+```
+
+This expanded weekly-seasonal model has a reported Kaggle public MAE of
+`0.7799`. Keep its model directory and submission for comparison when running
+feature ablations.
+
+The current controlled ablation removes inference-constant coverage/day-index
+features, duplicate week-13 summaries, and low-gain raw wind summaries. Wind
+seasonal anomalies, weekly bins, weekly trends, and drought interactions remain
+available to the model. Prediction detects older metadata and rebuilds removed
+features when loading pre-ablation models.
+
+The trained 684-feature controlled ablation model under
+`models_exp_150k_s8_no_score_weekly_seasonal_ablation/` has a reported Kaggle
+public MAE of `0.7754` and is the current baseline. Preserve that model
+directory. Regenerate its submission with:
+
+```bash
+.venv/bin/python src/predict.py \
+  --model-dir models_exp_150k_s8_no_score_weekly_seasonal_ablation \
+  --output submissions/submission_150k_s8_no_score_weekly_seasonal_ablation.csv
+```
+
+The next controlled experiment is implemented as the current
+feature-generation default. It removes the unused `prec_w56_min` feature and
+raw wet-bulb summaries while retaining wet-bulb weekly bins, the 13-week trend,
+and region seasonal anomalies. Train it into a separate model directory so the
+`0.7754` baseline remains available for comparison.
 
 Debug training:
 
@@ -131,3 +188,5 @@ After training, generate a submission:
 ```
 
 The output preserves the exact row order and columns from `sample_submission.csv`.
+Prediction reads `train.csv` even for weather-only models because region
+seasonal anomaly features require historical weather climatology.
