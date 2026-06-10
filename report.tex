@@ -20,9 +20,9 @@
 
 \author{\IEEEauthorblockN{112550191 HSU SHU WEI}
 \and
-\IEEEauthorblockN{TODO: Member 2's name}
+\IEEEauthorblockN{314551096 CHI WEI LING}
 \and
-\IEEEauthorblockN{TODO: Member 3's name}
+\IEEEauthorblockN{313554066 WU CHI CHUN}
 }
 
 \maketitle
@@ -168,6 +168,7 @@ and the temporal shape of the recent weather sequence.
 \centering
 \caption{Representative high-impact engineered features.}
 \label{tab:core_features}
+\renewcommand{\arraystretch}{1.3}
 \begin{tabular}{p{0.30\columnwidth}p{0.43\columnwidth}p{0.15\columnwidth}}
 \toprule
 Feature & Function & Reference \\
@@ -175,9 +176,11 @@ Feature & Function & Reference \\
 \texttt{hot\_dry\_w28} & 28-day heat stress divided by recent rainfall,
 capturing hot-dry atmospheric demand. & MSDI/SPEI~\cite{hao2013msdi,
 vicente2010spei} \\
+\addlinespace
 \texttt{prec\_region\_}\newline\texttt{seasonal\_anom\_w91} & 91-day
 precipitation deviation from the region's normal season. & SPI/SPEI~\cite{mckee1993spi,
 vicente2010spei} \\
+\addlinespace
 \texttt{tmp\_range\_region\_}\newline\texttt{seasonal\_anom\_w91} &
 Temperature-range deviation related to heat and moisture stress. &
 Review~\cite{mishra2010review} \\
@@ -295,6 +298,7 @@ structure, so these features give the model a compact representation of the
 annual cycle.
 
 \subsection{Training Pipeline}
+\label{sec:training_pipeline}
 
 Training examples are generated from labeled weekly rows in \texttt{train.csv}.
 For each horizon, the pipeline selects historical cutoffs, extracts the previous
@@ -363,16 +367,25 @@ accumulation and makes feature importance interpretable horizon by horizon.
 \label{tab:training_config}
 \begin{tabular}{p{0.40\columnwidth}p{0.48\columnwidth}}
 \toprule
+\renewcommand{\arraystretch}{1.3}
 Item & Value \\
 \midrule
 Model & Tree-based regression; CatBoost is best in model ablation \\
+\addlinespace
 Forecast structure & One model per horizon \\
+\addlinespace
 Horizons & 1--5 weeks \\
+\addlinespace
 Input history & 91 daily weather observations \\
+\addlinespace
 Training cap & 150,000 examples per horizon \\
+\addlinespace
 Sampling stride & 8 weekly labeled rows \\
+\addlinespace
 Best feature count & 641 per horizon \\
+\addlinespace
 Score features & Disabled in best submission \\
+\addlinespace
 Post-processing & Clip predictions to $[0,5]$ \\
 \bottomrule
 \end{tabular}
@@ -464,6 +477,69 @@ We omit earlier local validation numbers because their setup used nearby score
 information and was not representative of the final test input, where recent
 score labels are unavailable.
 
+\subsection{Multi-Fold Time-Based Local Validation}
+\label{sec:multi_fold}
+
+A single time-based validation split only checks one cutoff per region, so it
+cannot reveal whether the local error estimate is sensitive to \emph{which}
+historical period is held out. To address the multi-cutoff validation gap
+noted above, and to make each local validation example mirror the Kaggle test
+format as closely as possible (one 91-day input window producing five
+horizon-specific predictions per region), we construct $K=3$ non-overlapping
+validation folds per region.
+
+For region $r$, let $t_1 < t_2 < \cdots < t_{m_r}$ denote the day indices that
+carry a non-null weekly score, ordered from oldest to most recent. With
+$w=5$ labeled weeks per fold, fold $k \in \{0,1,\ldots,K-1\}$ (where $k=0$ is
+the most recent fold and is closest in time to the Kaggle test split) is
+anchored at the cutoff
+\begin{equation}
+T_r^{(k)} = t_{\,m_r-(k+1)w+1} - 7.
+\end{equation}
+Fold $k$ contributes a single 91-day input window $X_{r,T_r^{(k)}}$, which is
+reused to generate one validation example per horizon:
+\begin{equation}
+\Big(\phi\big(X_{r,T_r^{(k)}}, r, T_r^{(k)}\big),\;
+      y_{r,\,T_r^{(k)}+7h}\Big), \quad h=1,\ldots,5.
+\end{equation}
+In other words, each fold behaves exactly like one test-time region: a fixed
+91-day weather window that is scored against five future weekly labels, one
+per horizon.
+
+\begin{figure}[t]
+\centering
+\fbox{\begin{minipage}{0.95\columnwidth}
+\centering
+\resizebox{0.92\linewidth}{!}{%
+\begin{tabular}{cccc}
+training cutoffs & fold 2 & fold 1 & fold 0 \\
+cutoff $< T_2 - 7g$ &
+$[T_2, T_2{+}35]$ &
+$[T_1, T_1{+}35]$ &
+$[T_0, T_0{+}35]$ \\
+\end{tabular}}\\[4pt]
+\scriptsize oldest $\longrightarrow$ newest \quad (fold 0 closest to the Kaggle test split)
+\end{minipage}}
+\caption{Layout of the $K=3$ non-overlapping validation folds. Here $T_k
+\equiv T_r^{(k)}$ for brevity. Each fold $k$ reuses one 91-day input window
+ending at $T_k$ to predict all five horizons $T_k{+}7,\ldots,T_k{+}35$.
+Training cutoffs are restricted to targets earlier than fold 2's window,
+optionally shifted further back by a gap of $g$ weeks.}
+\label{fig:multi_fold_layout}
+\end{figure}
+
+Training examples for every horizon are drawn only from cutoffs whose
+horizon-$h$ target lies strictly before fold 2's window, i.e.\ before
+$t_{\,m_r-Kw+1}$, so that no validation label can leak into training. We also
+introduce an optional gap of $g$ weeks (\texttt{train\_gap\_weeks}) that
+removes the $g$ weeks immediately preceding fold 2 from the training pool,
+emulating the roughly 60-week separation between Kaggle's visible training
+history and its hidden test targets. All other settings (the 641-feature
+filtered weather-only feature set, stride 8, a cap of 150{,}000 training
+examples per horizon, and the LightGBM backend) are unchanged from
+Section~\ref{sec:training_pipeline} so that the multi-fold result is directly
+comparable to the single-split numbers reported earlier.
+
 \subsection{Feature Ablation}
 
 We perform feature ablation on the 641-feature filtered LightGBM setup. Each
@@ -477,11 +553,15 @@ size, stride, weather-only setting, and prediction pipeline. The original
 \label{tab:feature_ablation}
 \begin{tabular}{p{0.70\columnwidth}r}
 \toprule
+\renewcommand{\arraystretch}{1.3}
 Setting & Public MAE \\
 \midrule
 Original 641-feature model & 0.7745 \\
+\addlinespace
 w/o \texttt{hot\_dry\_w28} & 0.7850 \\
+\addlinespace
 w/o \texttt{prec\_region\_}\newline\texttt{seasonal\_anom\_w91} & 0.7770 \\
+\addlinespace
 w/o \texttt{tmp\_range\_region\_}\newline\texttt{seasonal\_anom\_w91} & 0.7707 \\
 \bottomrule
 \end{tabular}

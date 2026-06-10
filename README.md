@@ -15,21 +15,35 @@ Use `progress.md` for quick context before making changes. Use `concept.md` when
 
 ## Environment
 
-Use the project virtual environment:
+Create or reuse the project virtual environment and install the pinned
+dependencies:
 
 ```bash
-.venv/bin/python src/validate.py --debug
-.venv/bin/python src/train.py
-.venv/bin/python src/predict.py --output submissions/submission.csv
+python -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
 ```
 
-The scripts prefer LightGBM when installed. If LightGBM is unavailable, they fall back to scikit-learn regressors.
+All commands below assume they are run from the repository root. The expected
+input files are:
+
+- `data/train.csv`: training rows with `region_id`, `date`, weather columns, and
+  weekly `score` labels.
+- `data/test.csv`: 91 daily weather rows for each test `region_id`.
+- `sample_submission.csv`: Kaggle submission template.
+
+The main scripts are plain Python entry points and can be inspected with
+`--help`:
+
+```bash
+.venv/bin/python src/train.py --help
+.venv/bin/python src/predict.py --help
+```
 
 ## Files
 
 - `src/make_features.py`: shared data loading and 91-day window feature generation.
-- `src/validate.py`: time-based validation with baselines and horizon MAE.
-- `src/train.py`: trains one model per forecast horizon and saves models under `models/`.
+- `src/validate.py`: optional time-based validation/sanity check.
+- `src/train.py`: trains one model per forecast horizon and saves models under a model directory.
 - `src/predict.py`: loads saved models and writes a Kaggle-format submission.
 
 ## Feature Engineering
@@ -59,134 +73,215 @@ Features include:
 - Relative seasonal features from anonymized date strings.
 - Optional historical score persistence features. When enabled, training examples only use scores before the 91-day weather window starts, matching the fact that test windows contain weather but no score labels. Use `--no-score-features` to train or validate weather-only models.
 
-## Validation
+## Quick Reproduction
 
-Validation is time-based, not random. For each region, `src/validate.py` holds out the latest five weekly labels and builds one validation forecast block with horizons 1 through 5. It reports:
+The report uses the weather-only 641-feature filtered setup with CatBoost as the
+best model backend. The full experiment uses stride 8 and at most 150,000
+training examples per horizon.
 
-- Global mean score baseline.
-- Region historical mean baseline.
-- Recent region score mean baseline.
-- First model result.
-- Overall MAE and MAE by horizon.
-
-For memory control, validation builds and trains one horizon at a time instead
-of materializing all five horizon feature matrices at once.
-
-Quick check:
-
-```bash
-.venv/bin/python src/validate.py --debug
-```
-
-Fuller validation can be run by increasing regions/examples or disabling caps:
-
-```bash
-.venv/bin/python src/validate.py --stride 4 --max-train-examples-per-horizon 250000
-```
-
-Feature generation can be parallelized across independent regions:
-
-```bash
-.venv/bin/python src/validate.py --n-jobs 4
-```
-
-Use `--n-jobs 0` for conservative auto mode, currently capped at 4 workers.
-Keep this lower if memory pressure or CPU contention with model training becomes
-a problem.
-
-Parallel workers receive only one region's `values`, `dates`, and `scores`
-arrays at a time, not the full training DataFrame. Each worker also builds a
-small expanding monthly weather climatology for leakage-safe region seasonal
-anomaly features. Completed region features are returned as compact `float32`
-NumPy chunks to limit parent-process memory usage.
-
-Weather-only validation:
-
-```bash
-.venv/bin/python src/validate.py --no-score-features
-```
-
-## Training
-
-Default training uses every fourth weekly target and caps each horizon at 250,000 examples to keep runtime practical on a large CSV. Use `--stride 1 --max-train-examples-per-horizon 0` for exhaustive feature generation if hardware allows.
-
-```bash
-.venv/bin/python src/train.py
-```
-
-Parallel feature generation during training:
-
-```bash
-.venv/bin/python src/train.py --n-jobs 4
-```
-
-Training still builds and fits one horizon at a time, so `--n-jobs` speeds up
-per-horizon feature generation without materializing all five horizon matrices
-at once. Each training run also writes `feature_importance.csv` under its model
-directory with per-horizon LightGBM split and gain importance. Use
-`src/analyze_features.py` separately when validation-based permutation
-importance is needed. Train gain importance is useful for selecting ablation
-candidates, but it is not enough by itself to prove that a feature should be
-deleted.
-
-Weather-only training:
-
-```bash
-.venv/bin/python src/train.py --no-score-features --model-dir models_no_score
-```
-
-Current expanded weather-only experiment:
+Build the reusable feature cache once:
 
 ```bash
 .venv/bin/python src/train.py \
-  --model-dir models_exp_150k_s8_no_score_weekly_seasonal \
+  --feature-cache-only \
+  --model-dir models_feature_cache_only_641 \
+  --feature-cache-dir feature_cache_150k_s8_no_score_weekly_seasonal_filtered \
+  --feature-version filtered_641 \
   --max-train-examples-per-horizon 150000 \
   --stride 8 \
   --n-jobs 2 \
   --no-score-features
 ```
 
-This expanded weekly-seasonal model has a reported Kaggle public MAE of
-`0.7799`. Keep its model directory and submission for comparison when running
-feature ablations.
+If this cache directory already exists and its `cache_metadata.json` matches the
+command settings, this step can be skipped. The later training command will load
+the existing `feature_horizon_*.joblib` files automatically.
 
-The current controlled ablation removes inference-constant coverage/day-index
-features, duplicate week-13 summaries, and low-gain raw wind summaries. Wind
-seasonal anomalies, weekly bins, weekly trends, and drought interactions remain
-available to the model. Prediction detects older metadata and rebuilds removed
-features when loading pre-ablation models.
+Train the CatBoost model from that cache:
 
-The trained 684-feature controlled ablation model under
-`models_exp_150k_s8_no_score_weekly_seasonal_ablation/` has a reported Kaggle
-public MAE of `0.7754` and is the current baseline. Preserve that model
-directory. Regenerate its submission with:
+```bash
+.venv/bin/python src/train.py \
+  --model-kind catboost \
+  --model-dir models_exp_150k_s8_no_score_weekly_seasonal_filtered_catboost \
+  --feature-cache-dir feature_cache_150k_s8_no_score_weekly_seasonal_filtered \
+  --feature-version filtered_641 \
+  --max-train-examples-per-horizon 150000 \
+  --stride 8 \
+  --n-jobs 2 \
+  --model-n-jobs 2 \
+  --rf-n-estimators 80 \
+  --rf-max-depth 24 \
+  --rf-max-samples 0.5 \
+  --rf-min-samples-leaf 10 \
+  --rf-max-features sqrt \
+  --no-score-features
+```
+
+Generate the Kaggle submission:
 
 ```bash
 .venv/bin/python src/predict.py \
-  --model-dir models_exp_150k_s8_no_score_weekly_seasonal_ablation \
-  --output submissions/submission_150k_s8_no_score_weekly_seasonal_ablation.csv
+  --model-dir models_exp_150k_s8_no_score_weekly_seasonal_filtered_catboost \
+  --output submissions/submission_150k_s8_no_score_weekly_seasonal_filtered_catboost.csv
 ```
 
-The next controlled experiment is implemented as the current
-feature-generation default. It removes the unused `prec_w56_min` feature and
-raw wet-bulb summaries while retaining wet-bulb weekly bins, the 13-week trend,
-and region seasonal anomalies. Train it into a separate model directory so the
-`0.7754` baseline remains available for comparison.
+The resulting CSV keeps the exact row order and columns from
+`sample_submission.csv`. Prediction reads `data/train.csv` even for
+weather-only models because regional seasonal anomaly features need historical
+weather climatology.
 
-Debug training:
+## Training Options
+
+`src/train.py` trains five independent models, one for each forecast horizon.
+It writes:
+
+- `horizon_1.joblib` through `horizon_5.joblib`: trained models.
+- `metadata.json`: feature columns, training settings, runtime, model kind, and
+  feature version.
+- `feature_importance.csv`: per-horizon feature importance when the backend
+  exposes it.
+
+The most important training arguments are:
+
+- `--model-kind lightgbm|xgboost|catboost|random_forest`: model backend.
+- `--feature-version filtered_641|aggressive_620`: feature set version.
+  `filtered_641` is the default and the report setup. `aggressive_620` removes
+  21 additional low-gain raw summary/event features.
+- `--feature-cache-dir DIR`: read/write per-horizon supervised feature matrices.
+- `--feature-cache-only`: build feature caches and exit before model training.
+- `--no-score-features`: disable historical score features. This is used for
+  the final weather-only submissions.
+- `--stride N`: use every Nth weekly labeled row before the final random cap.
+- `--max-train-examples-per-horizon N`: cap each horizon after feature
+  generation. Use `0` for no cap.
+- `--n-jobs N`: number of region-level feature-generation workers. Use `0` for
+  conservative auto mode.
+
+Feature cache files are named `feature_horizon_1.joblib` through
+`feature_horizon_5.joblib`. They contain `X`, `y`, and `meta`, not trained
+models. Cache metadata records the feature version and training settings; if a
+setting differs, training stops with a cache mismatch error. Use a separate
+cache directory for 641-feature and 620-feature experiments.
+
+For a quick smoke test:
 
 ```bash
-.venv/bin/python src/train.py --debug
+.venv/bin/python src/train.py --debug --no-score-features
 ```
 
-## Prediction
+## Model Ablation
 
-After training, generate a submission:
+To compare model backbones fairly, reuse the same `filtered_641` feature cache
+and change only `--model-kind`.
 
 ```bash
-.venv/bin/python src/predict.py --output submissions/submission.csv
+# LightGBM
+.venv/bin/python src/train.py \
+  --model-kind lightgbm \
+  --model-dir models_exp_150k_s8_no_score_weekly_seasonal_filtered_lgbm \
+  --feature-cache-dir feature_cache_150k_s8_no_score_weekly_seasonal_filtered \
+  --feature-version filtered_641 \
+  --max-train-examples-per-horizon 150000 \
+  --stride 8 \
+  --n-jobs 2 \
+  --no-score-features
+
+# XGBoost
+.venv/bin/python src/train.py \
+  --model-kind xgboost \
+  --model-dir models_exp_150k_s8_no_score_weekly_seasonal_filtered_xgboost \
+  --feature-cache-dir feature_cache_150k_s8_no_score_weekly_seasonal_filtered \
+  --feature-version filtered_641 \
+  --max-train-examples-per-horizon 150000 \
+  --stride 8 \
+  --n-jobs 2 \
+  --no-score-features
+
+# CatBoost
+.venv/bin/python src/train.py \
+  --model-kind catboost \
+  --model-dir models_exp_150k_s8_no_score_weekly_seasonal_filtered_catboost \
+  --feature-cache-dir feature_cache_150k_s8_no_score_weekly_seasonal_filtered \
+  --feature-version filtered_641 \
+  --max-train-examples-per-horizon 150000 \
+  --stride 8 \
+  --n-jobs 2 \
+  --no-score-features
+
+# Random Forest
+.venv/bin/python src/train.py \
+  --model-kind random_forest \
+  --model-dir models_exp_150k_s8_no_score_weekly_seasonal_filtered_random_forest \
+  --feature-cache-dir feature_cache_150k_s8_no_score_weekly_seasonal_filtered \
+  --feature-version filtered_641 \
+  --max-train-examples-per-horizon 150000 \
+  --stride 8 \
+  --n-jobs 2 \
+  --model-n-jobs 2 \
+  --rf-n-estimators 80 \
+  --rf-max-depth 24 \
+  --rf-max-samples 0.5 \
+  --rf-min-samples-leaf 10 \
+  --rf-max-features sqrt \
+  --no-score-features
 ```
 
-The output preserves the exact row order and columns from `sample_submission.csv`.
-Prediction reads `train.csv` even for weather-only models because region
-seasonal anomaly features require historical weather climatology.
+## Feature-Version Experiments
+
+The default feature version is `filtered_641`. To test the smaller 620-feature
+variant, use a different cache directory:
+
+```bash
+.venv/bin/python src/train.py \
+  --feature-version aggressive_620 \
+  --model-kind catboost \
+  --model-dir models_exp_150k_s8_no_score_weekly_seasonal_aggressive_620_catboost \
+  --feature-cache-dir feature_cache_150k_s8_no_score_weekly_seasonal_aggressive_620 \
+  --max-train-examples-per-horizon 150000 \
+  --stride 8 \
+  --n-jobs 2 \
+  --no-score-features
+```
+
+Do not reuse a `filtered_641` cache for `aggressive_620`, or the reverse.
+
+## Prediction Modes
+
+Default prediction mode loads trained models:
+
+```bash
+.venv/bin/python src/predict.py \
+  --model-dir models_exp_150k_s8_no_score_weekly_seasonal_filtered_catboost \
+  --output submissions/submission.csv
+```
+
+Optional baseline/debug modes are also available:
+
+```bash
+.venv/bin/python src/predict.py --mode zero --output submissions/zero.csv
+.venv/bin/python src/predict.py --mode latest-score --output submissions/latest_score.csv
+```
+
+Blend modes exist for calibration experiments but are not used for the reported
+weather-only CatBoost result:
+
+```bash
+.venv/bin/python src/predict.py \
+  --model-dir models_exp_150k_s8_no_score_weekly_seasonal_filtered_catboost \
+  --mode blend-zero \
+  --zero-weight 0.75 \
+  --output submissions/blend_zero.csv
+```
+
+## Validation
+
+`src/validate.py` remains available for quick pipeline sanity checks:
+
+```bash
+.venv/bin/python src/validate.py --debug --no-score-features
+```
+
+Earlier local validation numbers are not reported as final results because they
+used nearby score information and were not representative of the final Kaggle
+test input, where recent score labels are unavailable. The report therefore
+uses Kaggle public MAE for the submitted model and ablation comparisons.

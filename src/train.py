@@ -36,7 +36,17 @@ def include_low_gain_filtered_features(feature_version: str) -> bool:
     raise ValueError(f"Unknown feature version: {feature_version}")
 
 
-def make_model(model_kind: str = "lightgbm", random_state: int = 42):
+def make_model(
+    model_kind: str = "lightgbm",
+    random_state: int = 42,
+    model_n_jobs: int = -1,
+    rf_n_estimators: int = 80,
+    rf_max_depth: int | None = 24,
+    rf_max_samples: float = 0.5,
+    rf_min_samples_leaf: int = 10,
+    rf_max_features: str | float = "sqrt",
+    rf_verbose: int = 1,
+):
     if model_kind == "lightgbm":
         try:
             os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
@@ -54,7 +64,7 @@ def make_model(model_kind: str = "lightgbm", random_state: int = 42):
             colsample_bytree=0.85,
             reg_lambda=2.0,
             min_child_samples=80,
-            n_jobs=-1,
+            n_jobs=model_n_jobs,
             random_state=random_state,
             verbosity=-1,
         ), "lightgbm"
@@ -77,7 +87,7 @@ def make_model(model_kind: str = "lightgbm", random_state: int = 42):
             colsample_bytree=0.85,
             reg_lambda=2.0,
             min_child_weight=80,
-            n_jobs=-1,
+            n_jobs=model_n_jobs,
             random_state=random_state,
             verbosity=0,
         ), "xgboost"
@@ -95,7 +105,7 @@ def make_model(model_kind: str = "lightgbm", random_state: int = 42):
             depth=8,
             l2_leaf_reg=2.0,
             random_seed=random_state,
-            thread_count=-1,
+            thread_count=model_n_jobs,
             verbose=False,
             allow_writing_files=False,
         ), "catboost"
@@ -107,15 +117,16 @@ def make_model(model_kind: str = "lightgbm", random_state: int = 42):
             raise RuntimeError("scikit-learn is not available. Install scikit-learn in the project venv.") from exc
 
         return RandomForestRegressor(
-            n_estimators=300,
+            n_estimators=rf_n_estimators,
             criterion="squared_error",
-            max_features=0.7,
-            min_samples_leaf=5,
+            max_depth=rf_max_depth,
+            max_features=rf_max_features,
+            min_samples_leaf=rf_min_samples_leaf,
             bootstrap=True,
-            max_samples=0.85,
-            n_jobs=-1,
+            max_samples=rf_max_samples,
+            n_jobs=model_n_jobs,
             random_state=random_state,
-            verbose=0,
+            verbose=rf_verbose,
         ), "random_forest"
 
     raise ValueError(f"Unknown model kind: {model_kind}")
@@ -242,6 +253,47 @@ def parse_args() -> argparse.Namespace:
         help="Model backend to train.",
     )
     parser.add_argument(
+        "--model-n-jobs",
+        type=int,
+        default=-1,
+        help="Thread/process count passed to the model backend. This is separate from feature-generation --n-jobs.",
+    )
+    parser.add_argument(
+        "--rf-n-estimators",
+        type=int,
+        default=80,
+        help="RandomForest only: number of trees. The old value 300 is very slow for 150k x 641.",
+    )
+    parser.add_argument(
+        "--rf-max-depth",
+        type=int,
+        default=24,
+        help="RandomForest only: maximum tree depth. Use 0 for unlimited depth.",
+    )
+    parser.add_argument(
+        "--rf-max-samples",
+        type=float,
+        default=0.5,
+        help="RandomForest only: row fraction sampled per tree when bootstrap=True.",
+    )
+    parser.add_argument(
+        "--rf-min-samples-leaf",
+        type=int,
+        default=10,
+        help="RandomForest only: minimum samples per leaf.",
+    )
+    parser.add_argument(
+        "--rf-max-features",
+        default="sqrt",
+        help="RandomForest only: max_features. Use sqrt, log2, or a float such as 0.7.",
+    )
+    parser.add_argument(
+        "--rf-verbose",
+        type=int,
+        default=1,
+        help="RandomForest only: sklearn verbose level, useful because RF training can be long.",
+    )
+    parser.add_argument(
         "--feature-version",
         choices=FEATURE_VERSION_CHOICES,
         default=DEFAULT_FEATURE_VERSION,
@@ -276,6 +328,11 @@ def main() -> None:
         max_regions = max_regions or 20
         max_examples = min(max_examples or 10_000, 10_000)
         stride = max(stride, 12)
+    rf_max_depth = None if args.rf_max_depth == 0 else args.rf_max_depth
+    try:
+        rf_max_features: str | float = float(args.rf_max_features)
+    except ValueError:
+        rf_max_features = args.rf_max_features
 
     LOGGER.info("Reading training data from %s", args.train_csv)
     train_df = read_train_csv(args.train_csv, max_regions=max_regions)
@@ -315,6 +372,15 @@ def main() -> None:
         "feature_filter_version": args.feature_version,
         "include_low_gain_filtered_features": include_low_gain_filtered_features(args.feature_version),
         "requested_model_kind": args.model_kind,
+        "model_n_jobs": args.model_n_jobs,
+        "random_forest_params": {
+            "n_estimators": args.rf_n_estimators,
+            "max_depth": rf_max_depth,
+            "max_samples": args.rf_max_samples,
+            "min_samples_leaf": args.rf_min_samples_leaf,
+            "max_features": rf_max_features,
+            "verbose": args.rf_verbose,
+        },
         "train_command": shlex.join([sys.executable, *sys.argv]),
         "feature_cache_dir": str(feature_cache_dir) if feature_cache_dir else None,
     }
@@ -348,7 +414,17 @@ def main() -> None:
             gc.collect()
             continue
 
-        model, model_kind = make_model(args.model_kind, random_state=42 + h)
+        model, model_kind = make_model(
+            args.model_kind,
+            random_state=42 + h,
+            model_n_jobs=args.model_n_jobs,
+            rf_n_estimators=args.rf_n_estimators,
+            rf_max_depth=rf_max_depth,
+            rf_max_samples=args.rf_max_samples,
+            rf_min_samples_leaf=args.rf_min_samples_leaf,
+            rf_max_features=rf_max_features,
+            rf_verbose=args.rf_verbose,
+        )
         LOGGER.info("Training horizon %d %s model on %d rows x %d features", h, model_kind, len(X), X.shape[1])
         model.fit(X, y)
         importance_rows.extend(model_importance_rows(model, model_kind, h, feature_columns))
