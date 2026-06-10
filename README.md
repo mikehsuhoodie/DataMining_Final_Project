@@ -1,17 +1,8 @@
 # Drought Severity Forecasting Pipeline
-
+Group 5
 This repository contains a reproducible Python script pipeline for the Kaggle final project described in `concept.md`.
 
 The task is supervised regression: for each `region_id`, summarize the previous 91 days of meteorological observations and predict the next five weekly drought severity `score` values. Predictions are clipped to `[0, 5]` and are not rounded by default because Kaggle evaluates MAE.
-
-## AI Entry Point
-
-For future AI-assisted work, read these files first:
-
-- `concept.md`: project task, modeling assumptions, validation strategy, and current implementation direction.
-- `progress.md`: short current-state handoff with priorities, completed pieces, and known concerns. progress.md should remain concise. Remove outdated status notes instead of accumulating history.
-
-Use `progress.md` for quick context before making changes. Use `concept.md` when deciding whether a change matches the project direction.
 
 ## Environment
 
@@ -275,11 +266,55 @@ weather-only CatBoost result:
 
 ## Validation
 
-`src/validate.py` remains available for quick pipeline sanity checks:
+### Multi-Fold Time-Based Local Validation
+
+A robust local validation strategy is implemented using $K=3$ non-overlapping
+time-based folds per region. A single time-based validation split only checks
+one cutoff per region and cannot reveal whether the local error estimate is
+sensitive to which historical period is held out. Instead, the pipeline constructs
+$K=3$ non-overlapping validation folds per region, where each fold provides a
+single 91-day input window that produces five horizon-specific predictions,
+mirroring the Kaggle test format exactly.
+
+For each region, fold $k$ is anchored at a cutoff $T_r^{(k)}$. Fold $k=0$ is the
+most recent fold (closest to the Kaggle test time), and training examples are
+drawn only from cutoffs whose horizon-$h$ targets lie strictly before fold 2's
+window, preventing label leakage. An optional gap parameter (\texttt{train\_gap\_weeks})
+can emulate the roughly 60-week separation between Kaggle's visible training
+history and its hidden test targets.
+
+### Running Multi-Fold Local Validation
+
+Quick debug run:
 
 ```bash
 .venv/bin/python src/validate.py --debug --no-score-features
 ```
+
+Full 3-fold validation:
+
+```bash
+.venv/bin/python src/validate.py \
+  --n-val-folds 3 \
+  --val-weeks 5 \
+  --stride 8 \
+  --max-train-examples-per-horizon 150000 \
+  --no-score-features \
+  --output-dir validation/3fold_150k_s8_no_score \
+  --n-jobs 2
+```
+
+Key arguments:
+- `--n-val-folds N`: Number of validation folds per region (default: 1)
+- `--val-weeks W`: Weeks per fold (default: 5)
+- `--stride S`: Sampling interval for training (default: 8)
+- `--max-train-examples-per-horizon M`: Cap per horizon (default: 150,000; 0 = no limit)
+- `--train-gap-weeks G`: Exclude G weeks before fold 2 (simulates Kaggle gap)
+- `--no-score-features`: Use weather features only
+- `--n-jobs N`: Parallel workers (default: 1)
+- `--debug`: Fast run (20 regions)
+
+### Final Validation
 
 Earlier local validation numbers are not reported as final results because they
 used nearby score information and were not representative of the final Kaggle

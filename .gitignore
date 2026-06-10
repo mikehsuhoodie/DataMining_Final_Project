@@ -17,6 +17,7 @@ env/
 # Local agent/tool metadata
 .agents/
 .codex/
+local/
 
 # Data and archives
 data/
@@ -35,6 +36,7 @@ feature_analysis/
 feature_analysis_*/
 submissions/*.csv
 !sample_submission.csv
+notebooks/
 
 # Model parameters / serialized artifacts
 *.pt
