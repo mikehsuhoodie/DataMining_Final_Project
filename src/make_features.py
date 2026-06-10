@@ -46,6 +46,29 @@ PERCENTILES = [10, 50, 90]
 WEEKLY_BIN_DAYS = 7
 WEEKLY_BIN_COUNT = WINDOW_DAYS // WEEKLY_BIN_DAYS
 REGION_SEASONAL_WINDOWS = [28, 91]
+LOW_GAIN_FILTERED_FEATURES = {
+    "prec_w91_min",
+    "prec_w28_min",
+    "prec_w91_q10",
+    "prec_w56_q10",
+    "prec_w28_q10",
+    "rainy_days_w7",
+    "rainy_days_w14",
+    "dry_fraction_w91",
+    "tmp_min_last7_mean",
+    "tmp_last7_mean",
+    "tmp_max_last7_mean",
+    "surf_tmp_last7_mean",
+    "dp_tmp_last7_mean",
+    "prec_last7_mean",
+    "surf_pre_last7_mean",
+    "surf_pre_w91_mean",
+    "surf_pre_w56_mean",
+    "surf_pre_w28_mean",
+    "surf_pre_w91_median",
+    "surf_tmp_w14_mean",
+    "tmp_min_w56_mean",
+}
 
 COL_IDX = {c: i for i, c in enumerate(WEATHER_COLS)}
 PREC_IDX = COL_IDX["prec"]
@@ -109,6 +132,7 @@ def build_validation_sets(
     stride: int = 4,
     max_train_examples_per_horizon: int | None = None,
     include_score_features: bool = True,
+    include_low_gain_filtered_features: bool = True,
     n_jobs: int = 1,
 ) -> tuple[FeatureBuildResult, FeatureBuildResult]:
     """Build time-based train/validation examples.
@@ -127,14 +151,14 @@ def build_validation_sets(
     val_meta = {h: [] for h in HORIZONS}
 
     worker_args = (
-        (*payload, val_weeks, stride, per_region_budget, include_score_features)
+        (*payload, val_weeks, stride, per_region_budget, include_score_features, include_low_gain_filtered_features)
         for payload in _iter_region_arrays(train_df)
     )
     for region_result in _run_region_workers(_build_validation_region, worker_args, n_jobs):
         _extend_horizon_dicts(train_rows, train_y, train_meta, *region_result["train"])
         _extend_horizon_dicts(val_rows, val_y, val_meta, *region_result["val"])
 
-    feature_columns = _feature_columns(include_score_features)
+    feature_columns = _feature_columns(include_score_features, include_low_gain_filtered_features)
     train_result = _to_result(train_rows, train_y, train_meta, max_train_examples_per_horizon, feature_columns)
     val_result = _to_result(val_rows, val_y, val_meta, None, feature_columns)
     return train_result, val_result
@@ -147,6 +171,7 @@ def build_validation_set_for_horizon(
     stride: int = 4,
     max_train_examples: int | None = None,
     include_score_features: bool = True,
+    include_low_gain_filtered_features: bool = True,
     n_jobs: int = 1,
     n_val_folds: int = 1,
     train_gap_weeks: int = 0,
@@ -166,7 +191,8 @@ def build_validation_set_for_horizon(
     val_meta = []
 
     worker_args = (
-        (*payload, horizon, val_weeks, stride, per_region_budget, include_score_features, n_val_folds, train_gap_weeks)
+        (*payload, horizon, val_weeks, stride, per_region_budget, include_score_features, include_low_gain_filtered_features, n_val_folds, train_gap_weeks)
+
         for payload in _iter_region_arrays(train_df)
     )
     for region_train_rows, region_train_y, region_train_meta, region_val_rows, region_val_y, region_val_meta in (
@@ -179,7 +205,7 @@ def build_validation_set_for_horizon(
         val_y.extend(region_val_y)
         val_meta.extend(region_val_meta)
 
-    feature_columns = _feature_columns(include_score_features)
+    feature_columns = _feature_columns(include_score_features, include_low_gain_filtered_features)
     X_train, y_train, meta_train = _to_frame(train_rows, train_y, train_meta, max_train_examples, horizon, feature_columns)
     X_val, y_val, meta_val = _to_frame(val_rows, val_y, val_meta, None, horizon, feature_columns)
     return X_train, y_train, meta_train, X_val, y_val, meta_val
@@ -190,6 +216,7 @@ def build_training_sets(
     stride: int = 4,
     max_train_examples_per_horizon: int | None = None,
     include_score_features: bool = True,
+    include_low_gain_filtered_features: bool = True,
     n_jobs: int = 1,
 ) -> FeatureBuildResult:
     n_regions = train_df["region_id"].nunique()
@@ -199,13 +226,19 @@ def build_training_sets(
     meta = {h: [] for h in HORIZONS}
 
     worker_args = (
-        (*payload, stride, per_region_budget, include_score_features)
+        (*payload, stride, per_region_budget, include_score_features, include_low_gain_filtered_features)
         for payload in _iter_region_arrays(train_df)
     )
     for region_rows, region_y, region_meta in _run_region_workers(_build_training_region, worker_args, n_jobs):
         _extend_horizon_dicts(rows, y, meta, region_rows, region_y, region_meta)
 
-    return _to_result(rows, y, meta, max_train_examples_per_horizon, _feature_columns(include_score_features))
+    return _to_result(
+        rows,
+        y,
+        meta,
+        max_train_examples_per_horizon,
+        _feature_columns(include_score_features, include_low_gain_filtered_features),
+    )
 
 
 def build_training_set_for_horizon(
@@ -214,6 +247,7 @@ def build_training_set_for_horizon(
     stride: int = 4,
     max_train_examples: int | None = None,
     include_score_features: bool = True,
+    include_low_gain_filtered_features: bool = True,
     n_jobs: int = 1,
 ) -> tuple[pd.DataFrame, np.ndarray, pd.DataFrame]:
     """Build one horizon at a time to keep peak memory bounded."""
@@ -228,7 +262,7 @@ def build_training_set_for_horizon(
     meta = []
 
     worker_args = (
-        (*payload, horizon, stride, per_region_budget, include_score_features)
+        (*payload, horizon, stride, per_region_budget, include_score_features, include_low_gain_filtered_features)
         for payload in _iter_region_arrays(train_df)
     )
     for region_rows, region_y, region_meta in _run_region_workers(
@@ -240,7 +274,14 @@ def build_training_set_for_horizon(
         y.extend(region_y)
         meta.extend(region_meta)
 
-    X, yy, mm = _to_frame(rows, y, meta, max_train_examples, horizon, _feature_columns(include_score_features))
+    X, yy, mm = _to_frame(
+        rows,
+        y,
+        meta,
+        max_train_examples,
+        horizon,
+        _feature_columns(include_score_features, include_low_gain_filtered_features),
+    )
     return X, yy, mm
 
 
@@ -252,6 +293,7 @@ def build_test_features(
     include_raw_wind_features: bool = False,
     include_prec_w56_min: bool = False,
     include_raw_wb_tmp_features: bool = False,
+    include_low_gain_filtered_features: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     rows = []
     meta = []
@@ -276,6 +318,7 @@ def build_test_features(
                 include_raw_wind_features=include_raw_wind_features,
                 include_prec_w56_min=include_prec_w56_min,
                 include_raw_wb_tmp_features=include_raw_wb_tmp_features,
+                include_low_gain_filtered_features=include_low_gain_filtered_features,
             )
         )
         meta.append({"region_id": region_id})
@@ -295,6 +338,7 @@ def compute_window_features(
     include_raw_wind_features: bool = False,
     include_prec_w56_min: bool = False,
     include_raw_wb_tmp_features: bool = False,
+    include_low_gain_filtered_features: bool = True,
 ) -> dict[str, float]:
     window = values[cutoff - WINDOW_DAYS : cutoff]
     if len(window) != WINDOW_DAYS:
@@ -376,6 +420,8 @@ def compute_window_features(
         feats.pop("prec_w56_min", None)
     if not include_raw_wb_tmp_features:
         feats = _without_raw_weather_summaries(feats, ("wb_tmp_",))
+    if not include_low_gain_filtered_features:
+        feats = _without_low_gain_filtered_features(feats)
     if not include_score_features:
         return feats
     if score_history:
@@ -388,6 +434,10 @@ def compute_window_features(
 def _without_raw_wind_features(feats: dict[str, float]) -> dict[str, float]:
     wind_prefixes = ("wind_", "wind_max_", "wind_min_", "wind_range_")
     return _without_raw_weather_summaries(feats, wind_prefixes)
+
+
+def _without_low_gain_filtered_features(feats: dict[str, float]) -> dict[str, float]:
+    return {feature: value for feature, value in feats.items() if feature not in LOW_GAIN_FILTERED_FEATURES}
 
 
 def _without_raw_weather_summaries(
@@ -544,7 +594,17 @@ def _iter_region_arrays(df: pd.DataFrame):
 
 
 def _build_validation_region(args):
-    region_id, values, dates, scores, val_weeks, stride, per_region_budget, include_score_features = args
+    (
+        region_id,
+        values,
+        dates,
+        scores,
+        val_weeks,
+        stride,
+        per_region_budget,
+        include_score_features,
+        include_low_gain_filtered_features,
+    ) = args
     train_rows, train_y, train_meta = _empty_horizon_lists()
     val_rows, val_y, val_meta = _empty_horizon_lists()
 
@@ -563,7 +623,13 @@ def _build_validation_region(args):
             "val": (_pack_feature_rows_by_horizon(val_rows), val_y, val_meta),
         }
 
-    get_features = _make_region_feature_getter(values, dates, scores, include_score_features)
+    get_features = _make_region_feature_getter(
+        values,
+        dates,
+        scores,
+        include_score_features,
+        include_low_gain_filtered_features,
+    )
 
     for h in HORIZONS:
         target_idx = val_cutoff + 7 * h
@@ -591,7 +657,20 @@ def _build_validation_region(args):
 
 
 def _build_validation_region_for_horizon(args):
-    region_id, values, dates, scores, horizon, val_weeks, stride, per_region_budget, include_score_features, n_val_folds, train_gap_weeks = args
+
+    (
+        region_id,
+        values,
+        dates,
+        scores,
+        horizon,
+        val_weeks,
+        stride,
+        per_region_budget,
+        include_score_features,
+        include_low_gain_filtered_features,
+        n_val_folds, train_gap_weeks
+    ) = args
     train_rows = []
     train_y = []
     train_meta = []
@@ -606,7 +685,14 @@ def _build_validation_region_for_horizon(args):
         return _pack_feature_rows(train_rows), train_y, train_meta, _pack_feature_rows(val_rows), val_y, val_meta
 
     first_val_of_all = int(label_idx[-total_val_labels])
-    get_features = _make_region_feature_getter(values, dates, scores, include_score_features)
+    
+    get_features = _make_region_feature_getter(
+        values,
+        dates,
+        scores,
+        include_score_features,
+        include_low_gain_filtered_features,
+    )
 
     for fold in range(n_val_folds):
         end_pos = -val_weeks * fold if fold > 0 else None
@@ -637,12 +723,27 @@ def _build_validation_region_for_horizon(args):
 
 
 def _build_training_region(args):
-    region_id, values, dates, scores, stride, per_region_budget, include_score_features = args
+    (
+        region_id,
+        values,
+        dates,
+        scores,
+        stride,
+        per_region_budget,
+        include_score_features,
+        include_low_gain_filtered_features,
+    ) = args
     rows, y, meta = _empty_horizon_lists()
     label_idx = np.flatnonzero(~np.isnan(scores))
     label_idx = label_idx[label_idx >= WINDOW_DAYS + 7 * max(HORIZONS)]
     label_idx = _preselect_candidates(label_idx[:: max(1, stride)], per_region_budget)
-    get_features = _make_region_feature_getter(values, dates, scores, include_score_features)
+    get_features = _make_region_feature_getter(
+        values,
+        dates,
+        scores,
+        include_score_features,
+        include_low_gain_filtered_features,
+    )
 
     for target_idx in label_idx:
         for h in HORIZONS:
@@ -657,14 +758,30 @@ def _build_training_region(args):
 
 
 def _build_training_region_for_horizon(args):
-    region_id, values, dates, scores, horizon, stride, per_region_budget, include_score_features = args
+    (
+        region_id,
+        values,
+        dates,
+        scores,
+        horizon,
+        stride,
+        per_region_budget,
+        include_score_features,
+        include_low_gain_filtered_features,
+    ) = args
     rows = []
     y = []
     meta = []
     label_idx = np.flatnonzero(~np.isnan(scores))
     label_idx = label_idx[label_idx >= WINDOW_DAYS + 7 * max(HORIZONS)]
     label_idx = _preselect_candidates(label_idx[:: max(1, stride)], per_region_budget)
-    get_features = _make_region_feature_getter(values, dates, scores, include_score_features)
+    get_features = _make_region_feature_getter(
+        values,
+        dates,
+        scores,
+        include_score_features,
+        include_low_gain_filtered_features,
+    )
 
     for target_idx in label_idx:
         cutoff = int(target_idx - 7 * horizon)
@@ -682,6 +799,7 @@ def _make_region_feature_getter(
     dates: np.ndarray,
     scores: np.ndarray,
     include_score_features: bool,
+    include_low_gain_filtered_features: bool = True,
 ):
     cache: dict[int, dict[str, float]] = {}
     seasonal_context = _expanding_region_seasonal_context(values, dates)
@@ -697,6 +815,7 @@ def _make_region_feature_getter(
                 include_score_features,
                 seasonal_context=seasonal_context,
                 seasonal_history_end=max(0, cutoff - WINDOW_DAYS),
+                include_low_gain_filtered_features=include_low_gain_filtered_features,
             )
         return cache[cutoff]
 
@@ -713,11 +832,19 @@ def _pack_feature_rows_by_horizon(rows: dict[int, list[dict[str, float]]]) -> di
     return {h: _pack_feature_rows(rows[h]) for h in HORIZONS}
 
 
-@lru_cache(maxsize=2)
-def _feature_columns(include_score_features: bool) -> list[str]:
+@lru_cache(maxsize=4)
+def _feature_columns(include_score_features: bool, include_low_gain_filtered_features: bool = True) -> list[str]:
     values = np.zeros((WINDOW_DAYS, len(WEATHER_COLS)), dtype=np.float32)
     dates = np.full(WINDOW_DAYS, "2000-01-01")
-    return list(compute_window_features(values, dates, WINDOW_DAYS, include_score_features=include_score_features))
+    return list(
+        compute_window_features(
+            values,
+            dates,
+            WINDOW_DAYS,
+            include_score_features=include_score_features,
+            include_low_gain_filtered_features=include_low_gain_filtered_features,
+        )
+    )
 
 
 def _score_history_features(scores: np.ndarray, cutoff: int) -> dict[str, float]:

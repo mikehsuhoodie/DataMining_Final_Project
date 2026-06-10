@@ -20,18 +20,41 @@ progress.md should remain concise. Remove outdated status notes instead of accum
   calculations but its summaries are omitted because they duplicate existing
   recent 7-day features. Models trained before this change are a separate
   feature version and should remain available for ensemble comparisons.
-- The post-`0.7799` controlled ablation removes inference-constant
+- Naming note: use `filtered` for the fixed feature-set/model version that
+  removes known duplicate or inference-constant columns. Reserve `ablation` for
+  controlled experiments that compare feature/model variants.
+- The post-`0.7799` filtered feature set removes inference-constant
   `region_seasonal_coverage_w28`, `region_seasonal_coverage_w91`, and
   `day_index_mod_365`, plus week-13 bin summaries that exactly duplicated
   existing 7-day summaries. It also removes low-gain raw summaries for
   `wind`, `wind_max`, `wind_min`, and `wind_range`, while retaining their
   region seasonal anomalies, weekly bins, 13-week trends, and
   drought-interaction features.
-  Prediction retains a metadata-driven legacy path so pre-ablation models can
+  Prediction retains a metadata-driven legacy path so pre-filtered models can
   still rebuild their original test features.
 - `--n-jobs` supports region-level parallel feature generation. Workers receive
   per-region arrays rather than the full training DataFrame. `--n-jobs 0` uses a
   conservative auto mode capped at 4 workers.
+- `src/train.py` now supports
+  `--model-kind lightgbm|xgboost|catboost|random_forest` for model backend
+  comparison. XGBoost and CatBoost dependencies are installed in the project
+  venv and listed in `requirements.txt`; Random Forest uses the existing
+  scikit-learn dependency.
+- `src/train.py` supports per-horizon feature caches through
+  `--feature-cache-dir`. Cache files are named
+  `feature_horizon_1.joblib` through `feature_horizon_5.joblib` and contain
+  `X`, `y`, and `meta`, not trained models. Use `--feature-cache-only` to build
+  caches without training, or omit it to build missing caches and then train.
+- Training metadata now records `train_command`, `train_runtime_seconds`, and
+  `train_runtime_minutes`.
+- `src/train.py` supports `--feature-version filtered_641|aggressive_620`.
+  The default is `filtered_641`, which is the report setup. `aggressive_620`
+  removes 21 additional low-gain raw summary/event features from the 641-feature
+  setup. The feature version is recorded in model metadata and feature-cache
+  metadata.
+- Prediction detects model metadata and rebuilds the removed low-gain columns
+  only when the saved model expects them, so both 641-feature and 620-feature
+  model directories remain usable.
 - Feature workers return compact `float32` NumPy chunks instead of retaining
   large Python dictionaries in the parent process. This keeps the expanded
   871-feature weather-only setup within memory limits at 150k rows per horizon.
@@ -47,7 +70,8 @@ progress.md should remain concise. Remove outdated status notes instead of accum
   `feature_analysis_fast_30k_weather_only/`.
 - 150k model variants have been trained in `models_no_score_150k/` and
   `models_score_150k/`.
-- Current best reported Kaggle public MAE is `0.7754`.
+- Current best reported Kaggle public MAE is `0.7663` from CatBoost on the
+  641-feature filtered setup.
 - A `0.75 * old 100k stride-8 weather-only + 0.25 * new 150k stride-8
   weather-only` submission reached a reported Kaggle public MAE of `0.8703`.
 - The expanded 150k stride-8 weather-only model has been trained under
@@ -56,16 +80,16 @@ progress.md should remain concise. Remove outdated status notes instead of accum
 - The expanded weekly-seasonal submission reached a reported Kaggle public MAE
   of `0.7799`, improving substantially over the previous `0.8703` blend
   baseline. Preserve this submission and model for comparison.
-- The 684-feature controlled ablation model has been trained under
+- The 684-feature filtered model has been trained under
   `models_exp_150k_s8_no_score_weekly_seasonal_ablation/`, with its submission
   under
   `submissions/submission_150k_s8_no_score_weekly_seasonal_ablation.csv`.
   It reached a reported Kaggle public MAE of `0.7754`, improving the expanded
   model by `0.0045`.
-- Preserve the existing current baseline model directory. Generate its
+- Preserve the existing 684-feature filtered baseline model directory. Generate its
   submission with:
   `.venv/bin/python src/predict.py --model-dir models_exp_150k_s8_no_score_weekly_seasonal_ablation --output submissions/submission_150k_s8_no_score_weekly_seasonal_ablation.csv`.
-- The ablation model's train gain importance is dominated by
+- The filtered model's train gain importance is dominated by
   `hot_dry_w28`, 91-day region seasonal precipitation anomaly, 91-day region
   seasonal temperature-range anomaly, and several other region seasonal
   anomaly features. Across all horizons, weekly bins account for about `25.1%`
@@ -77,22 +101,37 @@ progress.md should remain concise. Remove outdated status notes instead of accum
   the weather-only feature set from 684 to 641 columns. Prediction detects
   whether older model metadata requires the removed columns and rebuilds them
   when needed.
+- Aggressive filtered experiment is available through
+  `--feature-version aggressive_620` on top of Experiment A. Removed features:
+  `prec_w91_min`, `prec_w28_min`, `prec_w91_q10`, `prec_w56_q10`,
+  `prec_w28_q10`, `rainy_days_w7`, `rainy_days_w14`, `dry_fraction_w91`,
+  `tmp_min_last7_mean`, `tmp_last7_mean`, `tmp_max_last7_mean`,
+  `surf_tmp_last7_mean`, `dp_tmp_last7_mean`, `prec_last7_mean`,
+  `surf_pre_last7_mean`, `surf_pre_w91_mean`, `surf_pre_w56_mean`,
+  `surf_pre_w28_mean`, `surf_pre_w91_median`, `surf_tmp_w14_mean`, and
+  `tmp_min_w56_mean`.
 - Weather-only and score-feature submissions exist under `submissions/`,
   including 150k variants.
 
 ## Current Priority
 
-1. Preserve the controlled ablation `0.7754` model and submission as the
+1. Preserve the filtered `0.7754` model and submission as the
    current baseline. Keep the `0.7799` pre-ablation model for comparison.
-2. Train and submit experiment A: remove `prec_w56_min` and wet-bulb raw
-   summaries while retaining wet-bulb weekly and region seasonal features.
-3. Test dewpoint raw-summary removal as a separate ablation from the `0.7754`
+2. Use `--feature-version filtered_641` for report-aligned retraining. This is
+   also the default if the flag is omitted.
+3. Use `--feature-version aggressive_620` only for the optional 620-feature
+   experiment, with a distinct cache directory, e.g.
+   `feature_cache_150k_s8_no_score_weekly_seasonal_aggressive_620/`.
+4. Train XGBoost and CatBoost model-backend comparisons using the same
+   `150k`, `stride=8`, `--no-score-features`, `filtered_641` feature setup and
+   cache unless intentionally testing the 620-feature variant.
+5. Test dewpoint raw-summary removal as a separate ablation from the `0.7754`
    baseline while retaining its weekly and region seasonal features.
-4. Keep precipitation-event features for now. `dry_days_w91` has measured gain,
+6. Keep precipitation-event features for now. `dry_days_w91` has measured gain,
    so do not remove that group as part of an unrelated cleanup.
-5. Build multi-cutoff validation before broad model tuning or larger experiment
+7. Build multi-cutoff validation before broad model tuning or larger experiment
    sweeps.
-6. Use permutation importance and group ablation before broader feature
+8. Use permutation importance and group ablation before broader feature
    removal.
 
 ## Known Concerns
@@ -109,9 +148,13 @@ progress.md should remain concise. Remove outdated status notes instead of accum
   stop before each 91-day input window starts. Prediction uses each region's
   full official `train.csv` weather history as climatology and never adds test
   weather or hidden targets to that historical baseline.
-- Final feature matrix caching is not yet ideal because the feature set is still
-  changing. Prefer profiling, deduplication, parallelization, and lightweight
-  intermediate caches first.
+- Feature caches can become stale when the feature-generation defaults change.
+  Keep one cache directory per feature configuration; the cache metadata guard
+  checks run settings but cannot know the semantic intent of a reused directory
+  name.
+- Do not reuse a 641 cache for a 620 experiment or vice versa. Use distinct
+  cache directory names; `feature_version` in cache metadata now guards against
+  accidental reuse.
 - Kaggle public leaderboard should not be the only validation signal. Local
   validation is needed for fast feature selection and leakage checks.
 - Increasing `--max-train-examples-per-horizon` from 80k to 150k changes the

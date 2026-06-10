@@ -6,11 +6,13 @@ import gc
 import json
 import logging
 import os
+import shlex
+import sys
+import time
 from pathlib import Path
 
 import joblib
 import numpy as np
-from sklearn.ensemble import ExtraTreesRegressor, HistGradientBoostingRegressor
 
 from make_features import (
     HORIZONS,
@@ -22,13 +24,26 @@ from make_features import (
 
 
 LOGGER = logging.getLogger(__name__)
+FEATURE_VERSION_CHOICES = ("filtered_641", "aggressive_620")
+DEFAULT_FEATURE_VERSION = "filtered_641"
 
 
-def make_model(random_state: int = 42):
-    try:
-        os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
-        Path(os.environ["MPLCONFIGDIR"]).mkdir(parents=True, exist_ok=True)
-        from lightgbm import LGBMRegressor
+def include_low_gain_filtered_features(feature_version: str) -> bool:
+    if feature_version == "filtered_641":
+        return True
+    if feature_version == "aggressive_620":
+        return False
+    raise ValueError(f"Unknown feature version: {feature_version}")
+
+
+def make_model(model_kind: str = "lightgbm", random_state: int = 42):
+    if model_kind == "lightgbm":
+        try:
+            os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+            Path(os.environ["MPLCONFIGDIR"]).mkdir(parents=True, exist_ok=True)
+            from lightgbm import LGBMRegressor
+        except Exception as exc:
+            raise RuntimeError("LightGBM is not available. Install lightgbm in the project venv.") from exc
 
         return LGBMRegressor(
             objective="mae",
@@ -43,25 +58,67 @@ def make_model(random_state: int = 42):
             random_state=random_state,
             verbosity=-1,
         ), "lightgbm"
-    except Exception as exc:
-        LOGGER.warning("LightGBM unavailable (%s); using sklearn fallback", exc)
 
-    try:
-        return HistGradientBoostingRegressor(
-            loss="absolute_error",
-            max_iter=350,
-            learning_rate=0.05,
-            l2_regularization=0.05,
-            random_state=random_state,
-        ), "hist_gradient_boosting"
-    except Exception as exc:
-        LOGGER.warning("HistGradientBoosting unavailable (%s); using ExtraTrees", exc)
-        return ExtraTreesRegressor(
-            n_estimators=250,
-            min_samples_leaf=5,
+    if model_kind == "xgboost":
+        try:
+            from xgboost import XGBRegressor
+        except Exception as exc:
+            raise RuntimeError("XGBoost is not available. Install xgboost in the project venv.") from exc
+
+        return XGBRegressor(
+            objective="reg:absoluteerror",
+            eval_metric="mae",
+            n_estimators=450,
+            learning_rate=0.035,
+            max_leaves=63,
+            grow_policy="lossguide",
+            tree_method="hist",
+            subsample=0.85,
+            colsample_bytree=0.85,
+            reg_lambda=2.0,
+            min_child_weight=80,
             n_jobs=-1,
             random_state=random_state,
-        ), "extra_trees"
+            verbosity=0,
+        ), "xgboost"
+
+    if model_kind == "catboost":
+        try:
+            from catboost import CatBoostRegressor
+        except Exception as exc:
+            raise RuntimeError("CatBoost is not available. Install catboost in the project venv.") from exc
+
+        return CatBoostRegressor(
+            loss_function="MAE",
+            iterations=450,
+            learning_rate=0.035,
+            depth=8,
+            l2_leaf_reg=2.0,
+            random_seed=random_state,
+            thread_count=-1,
+            verbose=False,
+            allow_writing_files=False,
+        ), "catboost"
+
+    if model_kind == "random_forest":
+        try:
+            from sklearn.ensemble import RandomForestRegressor
+        except Exception as exc:
+            raise RuntimeError("scikit-learn is not available. Install scikit-learn in the project venv.") from exc
+
+        return RandomForestRegressor(
+            n_estimators=300,
+            criterion="squared_error",
+            max_features=0.7,
+            min_samples_leaf=5,
+            bootstrap=True,
+            max_samples=0.85,
+            n_jobs=-1,
+            random_state=random_state,
+            verbose=0,
+        ), "random_forest"
+
+    raise ValueError(f"Unknown model kind: {model_kind}")
 
 
 def model_importance_rows(model, model_kind: str, horizon: int, feature_columns: list[str]) -> list[dict]:
@@ -96,6 +153,64 @@ def write_model_importance(rows: list[dict], path: Path) -> None:
         writer.writerows(rows)
 
 
+def cache_config(
+    train_csv: str,
+    stride: int,
+    max_regions: int | None,
+    max_examples: int | None,
+    include_score_features: bool,
+    feature_version: str,
+    n_jobs: int,
+) -> dict:
+    return {
+        "train_csv": train_csv,
+        "stride": stride,
+        "max_regions": max_regions,
+        "max_train_examples_per_horizon": max_examples,
+        "include_score_features": include_score_features,
+        "score_history_timing": "window_start" if include_score_features else "disabled",
+        "feature_n_jobs": n_jobs,
+        "feature_matrix_dtype": "float32",
+        "feature_version": feature_version,
+        "feature_filter_version": feature_version,
+    }
+
+
+def cache_path(cache_dir: Path, horizon: int) -> Path:
+    return cache_dir / f"feature_horizon_{horizon}.joblib"
+
+
+def load_or_build_training_set(
+    train_df,
+    horizon: int,
+    args: argparse.Namespace,
+    stride: int,
+    max_examples: int | None,
+    cache_dir: Path | None,
+) -> tuple:
+    path = cache_path(cache_dir, horizon) if cache_dir else None
+    if path and path.exists():
+        LOGGER.info("Loading cached supervised features for horizon %d from %s", horizon, path)
+        payload = joblib.load(path)
+        return payload["X"], payload["y"], payload["meta"]
+
+    LOGGER.info("Building supervised features for horizon %d", horizon)
+    X, y, meta = build_training_set_for_horizon(
+        train_df,
+        horizon=horizon,
+        stride=stride,
+        max_train_examples=max_examples,
+        include_score_features=not args.no_score_features,
+        include_low_gain_filtered_features=include_low_gain_filtered_features(args.feature_version),
+        n_jobs=args.n_jobs,
+    )
+    if path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        LOGGER.info("Saving supervised feature cache for horizon %d to %s", horizon, path)
+        joblib.dump({"X": X, "y": y, "meta": meta}, path, compress=0)
+    return X, y, meta
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train drought forecasting models.")
     parser.add_argument("--train-csv", default="data/train.csv")
@@ -120,12 +235,35 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Train weather-only models without historical score persistence features.",
     )
+    parser.add_argument(
+        "--model-kind",
+        choices=["lightgbm", "xgboost", "catboost", "random_forest"],
+        default="lightgbm",
+        help="Model backend to train.",
+    )
+    parser.add_argument(
+        "--feature-version",
+        choices=FEATURE_VERSION_CHOICES,
+        default=DEFAULT_FEATURE_VERSION,
+        help="Feature set version. filtered_641 is the report/default setup; aggressive_620 removes extra low-gain features.",
+    )
+    parser.add_argument(
+        "--feature-cache-dir",
+        default=None,
+        help="Directory for per-horizon feature caches. Existing horizon caches are reused automatically.",
+    )
+    parser.add_argument(
+        "--feature-cache-only",
+        action="store_true",
+        help="Build or refresh feature caches, then exit before model training.",
+    )
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--drop-feature", type=str, action="append", help="Feature name to drop from training (can specify multiple times).")
     return parser.parse_args()
 
 
 def main() -> None:
+    run_started_at = time.perf_counter()
     args = parse_args()
     configure_logging(args.verbose)
     model_dir = Path(args.model_dir)
@@ -141,6 +279,29 @@ def main() -> None:
 
     LOGGER.info("Reading training data from %s", args.train_csv)
     train_df = read_train_csv(args.train_csv, max_regions=max_regions)
+    feature_cache_dir = Path(args.feature_cache_dir) if args.feature_cache_dir else None
+    feature_cache_config = cache_config(
+        args.train_csv,
+        stride,
+        max_regions,
+        max_examples,
+        include_score_features=not args.no_score_features,
+        feature_version=args.feature_version,
+        n_jobs=args.n_jobs,
+    )
+    if feature_cache_dir:
+        feature_cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_metadata_path = feature_cache_dir / "cache_metadata.json"
+        if cache_metadata_path.exists():
+            existing_cache_config = json.loads(cache_metadata_path.read_text(encoding="utf-8"))
+            if existing_cache_config != feature_cache_config:
+                raise RuntimeError(
+                    f"Feature cache config mismatch in {cache_metadata_path}. "
+                    "Use a different --feature-cache-dir or remove the old cache."
+                )
+        else:
+            cache_metadata_path.write_text(json.dumps(feature_cache_config, indent=2), encoding="utf-8")
+
     metadata = {
         "model_kind_by_horizon": {},
         "stride": stride,
@@ -150,20 +311,24 @@ def main() -> None:
         "score_history_timing": "window_start" if not args.no_score_features else "disabled",
         "feature_n_jobs": args.n_jobs,
         "feature_matrix_dtype": "float32",
-        "feature_ablation": "remove_prec_w56_min_and_raw_wb_tmp_summaries",
+        "feature_version": args.feature_version,
+        "feature_filter_version": args.feature_version,
+        "include_low_gain_filtered_features": include_low_gain_filtered_features(args.feature_version),
+        "requested_model_kind": args.model_kind,
+        "train_command": shlex.join([sys.executable, *sys.argv]),
+        "feature_cache_dir": str(feature_cache_dir) if feature_cache_dir else None,
     }
     feature_columns_by_horizon = {}
     importance_rows = []
 
     for h in HORIZONS:
-        LOGGER.info("Building supervised features for horizon %d", h)
-        X, y, _meta = build_training_set_for_horizon(
+        X, y, _meta = load_or_build_training_set(
             train_df,
-            horizon=h,
-            stride=stride,
-            max_train_examples=max_examples,
-            include_score_features=not args.no_score_features,
-            n_jobs=args.n_jobs,
+            h,
+            args,
+            stride,
+            max_examples,
+            feature_cache_dir,
         )
         if len(X) == 0:
             raise RuntimeError(f"No training examples were built for horizon {h}.")
@@ -175,21 +340,41 @@ def main() -> None:
             feature_columns = list(X.columns)  # 更新
         
         X = align_feature_columns(X, feature_columns)
+        feature_columns_by_horizon[str(h)] = feature_columns
 
-        model, model_kind = make_model(random_state=42 + h)
+        if args.feature_cache_only:
+            LOGGER.info("Skipping training for horizon %d because --feature-cache-only is set", h)
+            del X, y
+            gc.collect()
+            continue
+
+        model, model_kind = make_model(args.model_kind, random_state=42 + h)
         LOGGER.info("Training horizon %d %s model on %d rows x %d features", h, model_kind, len(X), X.shape[1])
         model.fit(X, y)
         importance_rows.extend(model_importance_rows(model, model_kind, h, feature_columns))
         model_path = model_dir / f"horizon_{h}.joblib"
         joblib.dump(model, model_path)
         metadata["model_kind_by_horizon"][str(h)] = model_kind
-        feature_columns_by_horizon[str(h)] = feature_columns
         LOGGER.info("Saved %s", model_path)
         del X, y, model
         gc.collect()
 
-    metadata["target_mean"] = float(np.nanmean(train_df["score"].to_numpy(dtype=np.float32)))
+    if args.feature_cache_only:
+        metadata["feature_columns_by_horizon"] = feature_columns_by_horizon
+        metadata["target_mean"] = float(np.nanmean(train_df["score"].to_numpy(dtype=np.float32)))
+        metadata["train_runtime_seconds"] = round(time.perf_counter() - run_started_at, 3)
+        metadata["train_runtime_minutes"] = round(metadata["train_runtime_seconds"] / 60.0, 3)
+        metadata["feature_cache_only"] = True
+        metadata_path = model_dir / "metadata.json"
+        metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        LOGGER.info("Saved %s", metadata_path)
+        LOGGER.info("Feature cache build complete; no models were trained.")
+        return
+
     metadata["feature_columns_by_horizon"] = feature_columns_by_horizon
+    metadata["target_mean"] = float(np.nanmean(train_df["score"].to_numpy(dtype=np.float32)))
+    metadata["train_runtime_seconds"] = round(time.perf_counter() - run_started_at, 3)
+    metadata["train_runtime_minutes"] = round(metadata["train_runtime_seconds"] / 60.0, 3)
     metadata_path = model_dir / "metadata.json"
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     LOGGER.info("Saved %s", metadata_path)
