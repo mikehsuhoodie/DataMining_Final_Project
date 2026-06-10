@@ -10,7 +10,16 @@ import joblib
 import numpy as np
 import pandas as pd
 
-from make_features import HORIZONS, PRED_COLS, align_feature_columns, build_test_features, configure_logging, read_test_csv, read_train_csv
+from make_features import (
+    HORIZONS,
+    LOW_GAIN_FILTERED_FEATURES,
+    PRED_COLS,
+    align_feature_columns,
+    build_test_features,
+    configure_logging,
+    read_test_csv,
+    read_train_csv,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -95,6 +104,10 @@ def main() -> None:
         "wb_tmp_w7_mean" in feature_columns
         for feature_columns in feature_columns_by_horizon.values()
     )
+    include_low_gain_filtered_features = any(
+        LOW_GAIN_FILTERED_FEATURES.intersection(feature_columns)
+        for feature_columns in feature_columns_by_horizon.values()
+    )
     LOGGER.info("Reading train weather history from %s", args.train_csv)
     train_df = read_train_csv(args.train_csv, max_regions=None)
 
@@ -109,6 +122,7 @@ def main() -> None:
         include_raw_wind_features=include_raw_wind_features,
         include_prec_w56_min=include_prec_w56_min,
         include_raw_wb_tmp_features=include_raw_wb_tmp_features,
+        include_low_gain_filtered_features=include_low_gain_filtered_features,
     )
 
     pred_by_horizon = {}
