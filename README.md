@@ -1,5 +1,6 @@
 # Drought Severity Forecasting Pipeline
 Group 15
+
 This repository contains a reproducible Python script pipeline for the Kaggle final project described in `concept.md`.
 
 The task is supervised regression: for each `region_id`, summarize the previous 91 days of meteorological observations and predict the next five weekly drought severity `score` values. Predictions are clipped to `[0, 5]` and are not rounded by default because Kaggle evaluates MAE.
