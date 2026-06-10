@@ -121,6 +121,7 @@ def parse_args() -> argparse.Namespace:
         help="Train weather-only models without historical score persistence features.",
     )
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--drop-feature", type=str, action="append", help="Feature name to drop from training (can specify multiple times).")
     return parser.parse_args()
 
 
@@ -167,6 +168,12 @@ def main() -> None:
         if len(X) == 0:
             raise RuntimeError(f"No training examples were built for horizon {h}.")
         feature_columns = list(X.columns)
+        
+        # Feature ablation
+        if args.drop_feature:
+            X = X.drop(columns=[c for c in args.drop_feature if c in X.columns])
+            feature_columns = list(X.columns)  # 更新
+        
         X = align_feature_columns(X, feature_columns)
 
         model, model_kind = make_model(random_state=42 + h)

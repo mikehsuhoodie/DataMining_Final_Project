@@ -41,15 +41,31 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Validate weather-only models without historical score persistence features.",
     )
+    parser.add_argument(
+        "--n-val-folds",
+        type=int,
+        default=1,
+        help="Number of non-overlapping validation folds per region. Fold 0 is most recent. Default: 1.",
+    )
+    parser.add_argument(
+        "--train-gap-weeks",
+        type=int,
+        default=0,
+        help="Skip this many weeks before validation when selecting training examples. Simulates Kaggle's ~60-week gap. Default: 0.",
+    )
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
 
 
-def baseline_scores(train_df: pd.DataFrame, val_meta: pd.DataFrame, y_true: np.ndarray) -> dict[str, float]:
+def baseline_scores(train_df: pd.DataFrame, val_meta: pd.DataFrame, y_true: np.ndarray, exclude_last: int = 5) -> dict[str, float]:
     global_mean = float(np.nanmean(train_df["score"].to_numpy(dtype=np.float32)))
     labeled = train_df.dropna(subset=["score"])
     region_mean = labeled.groupby("region_id", sort=False)["score"].mean().to_dict()
-    region_recent = labeled.groupby("region_id", sort=False)["score"].apply(lambda s: s.tail(8).mean()).to_dict()
+    region_recent = (
+        labeled.groupby("region_id", sort=False)["score"]
+        .apply(lambda s: s.iloc[:-exclude_last].tail(8).mean() if len(s) > exclude_last else s.mean())
+        .to_dict()
+    )
 
     regions = val_meta["region_id"].astype(str).to_numpy()
     pred_global = np.full(len(y_true), global_mean, dtype=np.float32)
@@ -85,6 +101,8 @@ def main() -> None:
     all_global = []
     all_region = []
     all_recent = []
+    all_fold_pieces = []
+    exclude_last = args.val_weeks * args.n_val_folds
 
     for h in HORIZONS:
         LOGGER.info("Building validation split for horizon %d", h)
@@ -96,13 +114,15 @@ def main() -> None:
             max_train_examples=max_examples,
             include_score_features=not args.no_score_features,
             n_jobs=args.n_jobs,
+            n_val_folds=args.n_val_folds,
+            train_gap_weeks=args.train_gap_weeks,
         )
         X_val = X_val.reindex(columns=X_train.columns, fill_value=0.0)
         if len(X_train) == 0 or len(X_val) == 0:
             LOGGER.warning("Skipping horizon %d because train or validation data is empty", h)
             continue
 
-        base = baseline_scores(train_df, val_meta, y_val)
+        base = baseline_scores(train_df, val_meta, y_val, exclude_last=exclude_last)
         model, model_kind = make_model(random_state=42 + h)
         LOGGER.info("Training validation horizon %d %s on %d rows", h, model_kind, len(X_train))
         model.fit(X_train, y_train)
@@ -125,10 +145,22 @@ def main() -> None:
         all_global.append(np.full(len(y_val), np.nanmean(train_df["score"]), dtype=np.float32))
         labeled = train_df.dropna(subset=["score"])
         region_mean = labeled.groupby("region_id", sort=False)["score"].mean().to_dict()
-        region_recent = labeled.groupby("region_id", sort=False)["score"].apply(lambda s: s.tail(8).mean()).to_dict()
+        region_recent = (
+            labeled.groupby("region_id", sort=False)["score"]
+            .apply(lambda s: s.iloc[:-exclude_last].tail(8).mean() if len(s) > exclude_last else s.mean())
+            .to_dict()
+        )
         regions = val_meta["region_id"].astype(str).to_numpy()
         all_region.append(np.array([region_mean.get(r, np.nanmean(train_df["score"])) for r in regions], dtype=np.float32))
         all_recent.append(np.array([region_recent.get(r, region_mean.get(r, np.nanmean(train_df["score"]))) for r in regions], dtype=np.float32))
+
+        if args.n_val_folds > 1 and "fold" in val_meta.columns:
+            piece = val_meta[["region_id", "fold"]].copy()
+            piece["horizon"] = h
+            piece["y_true"] = y_val
+            piece["y_pred"] = pred
+            all_fold_pieces.append(piece)
+
         del X_train, y_train, X_val, y_val, val_meta, model
         gc.collect()
 
@@ -159,6 +191,25 @@ def main() -> None:
     summary.to_csv(out_path, index=False)
     print(summary.to_string(index=False))
     LOGGER.info("Saved %s", out_path)
+
+    if all_fold_pieces:
+        combined = pd.concat(all_fold_pieces, ignore_index=True)
+        fold_summary = (
+            combined.groupby("fold")
+            .apply(
+                lambda df: pd.Series({
+                    "n_val": len(df),
+                    "model_mae": mean_absolute_error(df["y_true"], df["y_pred"]),
+                }),
+                include_groups=False,
+            )
+            .reset_index()
+        )
+        fold_path = output_dir / "validation_fold_mae.csv"
+        fold_summary.to_csv(fold_path, index=False)
+        print("\nPer-fold MAE (fold 0 = most recent, closest to Kaggle test):")
+        print(fold_summary.to_string(index=False))
+        LOGGER.info("Saved %s", fold_path)
 
 
 if __name__ == "__main__":

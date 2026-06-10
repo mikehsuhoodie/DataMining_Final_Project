@@ -148,6 +148,8 @@ def build_validation_set_for_horizon(
     max_train_examples: int | None = None,
     include_score_features: bool = True,
     n_jobs: int = 1,
+    n_val_folds: int = 1,
+    train_gap_weeks: int = 0,
 ) -> tuple[pd.DataFrame, np.ndarray, pd.DataFrame, pd.DataFrame, np.ndarray, pd.DataFrame]:
     """Build one validation horizon at a time to keep peak memory bounded."""
 
@@ -164,7 +166,7 @@ def build_validation_set_for_horizon(
     val_meta = []
 
     worker_args = (
-        (*payload, horizon, val_weeks, stride, per_region_budget, include_score_features)
+        (*payload, horizon, val_weeks, stride, per_region_budget, include_score_features, n_val_folds, train_gap_weeks)
         for payload in _iter_region_arrays(train_df)
     )
     for region_train_rows, region_train_y, region_train_meta, region_val_rows, region_val_y, region_val_meta in (
@@ -589,7 +591,7 @@ def _build_validation_region(args):
 
 
 def _build_validation_region_for_horizon(args):
-    region_id, values, dates, scores, horizon, val_weeks, stride, per_region_budget, include_score_features = args
+    region_id, values, dates, scores, horizon, val_weeks, stride, per_region_budget, include_score_features, n_val_folds, train_gap_weeks = args
     train_rows = []
     train_y = []
     train_meta = []
@@ -597,24 +599,30 @@ def _build_validation_region_for_horizon(args):
     val_y = []
     val_meta = []
 
+    n_val_folds = max(1, n_val_folds)
+    total_val_labels = val_weeks * n_val_folds
     label_idx = np.flatnonzero(~np.isnan(scores))
-    if len(label_idx) < val_weeks + max(HORIZONS) + 1:
+    if len(label_idx) < total_val_labels + max(HORIZONS) + 1:
         return _pack_feature_rows(train_rows), train_y, train_meta, _pack_feature_rows(val_rows), val_y, val_meta
 
-    first_val_target = int(label_idx[-val_weeks])
-    val_cutoff = first_val_target - 7
-    if val_cutoff < WINDOW_DAYS:
-        return _pack_feature_rows(train_rows), train_y, train_meta, _pack_feature_rows(val_rows), val_y, val_meta
-
+    first_val_of_all = int(label_idx[-total_val_labels])
     get_features = _make_region_feature_getter(values, dates, scores, include_score_features)
 
-    target_idx = val_cutoff + 7 * horizon
-    if target_idx < len(scores) and not np.isnan(scores[target_idx]):
-        val_rows.append(get_features(val_cutoff))
-        val_y.append(float(scores[target_idx]))
-        val_meta.append({"region_id": region_id, "cutoff_idx": val_cutoff, "target_idx": target_idx})
+    for fold in range(n_val_folds):
+        end_pos = -val_weeks * fold if fold > 0 else None
+        fold_labels = label_idx[-val_weeks * (fold + 1) : end_pos]
+        first_val_target = int(fold_labels[0])
+        val_cutoff = first_val_target - 7
+        if val_cutoff < WINDOW_DAYS:
+            continue
+        target_idx = val_cutoff + 7 * horizon
+        if target_idx < len(scores) and not np.isnan(scores[target_idx]):
+            val_rows.append(get_features(val_cutoff))
+            val_y.append(float(scores[target_idx]))
+            val_meta.append({"region_id": region_id, "cutoff_idx": val_cutoff, "target_idx": target_idx, "fold": fold})
 
-    cutoff_candidates = label_idx[label_idx < first_val_target]
+    train_hard_cutoff = first_val_of_all - train_gap_weeks * 7
+    cutoff_candidates = label_idx[label_idx < train_hard_cutoff]
     cutoff_candidates = cutoff_candidates[cutoff_candidates >= WINDOW_DAYS + 7 * max(HORIZONS)]
     cutoff_candidates = _preselect_candidates(cutoff_candidates[:: max(1, stride)], per_region_budget)
     for target_idx in cutoff_candidates:
